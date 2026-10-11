@@ -744,18 +744,26 @@ fn card(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, id: ItemId, pre: &st
         ui.painter().galley(pos2(th.max.x - dw, ty - dg.size().y / 2.0), dg, t.text_dim);
     }
     let nr = Rect::from_min_max(pos2(th.min.x, th.max.y + 2.0), pos2(th.max.x - dw - 6.0, th.max.y + 20.0));
+    let mut resp = resp;
     if show_name && !rename_field(app, ui, nr, Some(id.0), None, pre) {
         ui.painter().rect_filled(Rect::from_min_size(pos2(th.min.x, ty - 5.0), vec2(8.0, 10.0)), 1.5, label_color(app, it.label));
-        ui.painter().with_clip_rect(nr).text(
-            pos2(th.min.x + 12.0, ty),
-            Align2::LEFT_CENTER,
-            &it.name,
-            Tokens::ui(f - 0.5),
-            if badge.offline { OFFLINE } else { t.text },
-        );
+        let color = if badge.offline { OFFLINE } else { t.text };
+        let name = truncated_name(ui, &it.name, Tokens::ui(f - 0.5), color, nr.max.x - (th.min.x + 12.0));
+        ui.painter().galley(pos2(th.min.x + 12.0, ty - name.size().y / 2.0), name.clone(), color);
+        if name.elided && resp.hover_pos().is_some_and(|p| nr.contains(p)) {
+            resp = resp.on_hover_text(&it.name);
+        }
     }
     app.auto.add(&format!("{pre}.item.{}", id.0), th, &it.name);
     Some(resp)
+}
+
+/// A card's name on one line, cut with "…" to `max_width` as Premiere's Icon view cuts long
+/// names (`Galley::elided` tells whether it was cut, for the full name in a tooltip).
+fn truncated_name(ui: &egui::Ui, name: &str, font: egui::FontId, color: Color32, max_width: f32) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(name.to_owned(), font, color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(max_width.max(0.0));
+    ui.painter().layout_job(job)
 }
 
 fn bin_card(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, b: &Bin, v: &View, actions: &mut Actions) {
@@ -774,9 +782,18 @@ fn bin_card(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, b: &Bin, v: &Vie
     b.all_items(&mut n);
     let f = font(app);
     let nr = Rect::from_min_max(pos2(th.min.x, th.max.y + 2.0), pos2(th.max.x, th.max.y + 20.0));
+    let mut resp = resp;
     if !rename_field(app, ui, nr, None, Some(b.id.0), &v.prefix) {
-        ui.painter().with_clip_rect(nr).text(pos2(th.min.x, th.max.y + 11.0), Align2::LEFT_CENTER, &b.name, Tokens::ui(f - 0.5), t.text);
-        ui.painter().text(pos2(th.max.x, th.max.y + 11.0), Align2::RIGHT_CENTER, tlf!("{n} items", n = n.len()), Tokens::ui(f - 1.5), t.text_dim);
+        // the name gets the room left of the item count
+        let ty = th.max.y + 11.0;
+        let count = ui.painter().layout_no_wrap(tlf!("{n} items", n = n.len()), Tokens::ui(f - 1.5), t.text_dim);
+        let cw = count.size().x;
+        ui.painter().galley(pos2(th.max.x - cw, ty - count.size().y / 2.0), count, t.text_dim);
+        let name = truncated_name(ui, &b.name, Tokens::ui(f - 0.5), t.text, th.width() - cw - 6.0);
+        ui.painter().galley(pos2(th.min.x, ty - name.size().y / 2.0), name.clone(), t.text);
+        if name.elided && resp.hover_pos().is_some_and(|p| nr.contains(p)) {
+            resp = resp.on_hover_text(&b.name);
+        }
     }
     app.auto.add(&format!("{}.bin.{}", v.prefix, b.id.0), th, &b.name);
     accept_bin_drop(app, ui, th, b.id.0, actions);

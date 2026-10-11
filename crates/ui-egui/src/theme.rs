@@ -394,6 +394,11 @@ pub fn font_families() -> Vec<FontFamily> {
     vec![FontFamily::Proportional, FontFamily::Monospace, FontFamily::Name("semibold".into()), FontFamily::Name("medium".into())]
 }
 
+/// Faces every font family falls back to, after its Latin UI faces, for the symbols in interface
+/// text that Inter lacks: egui's emoji faces (✔ ✖ ⚙ ⚡) and JetBrains Mono, the only bundled face
+/// with "▸" (menu paths such as "Settings ▸ Audio Hardware" in status messages and tooltips).
+const SYMBOL_FALLBACKS: [&str; 3] = ["NotoEmoji-Regular", "emoji-icon-font", "jbmono"];
+
 /// Install the Latin UI fonts, Chinese fallback (craft-fonts or an installed face), Japanese
 /// craft-fonts and egui visuals. Document names keep their glyphs in every interface language.
 pub fn install(ctx: &egui::Context, t: &Tokens) {
@@ -406,6 +411,13 @@ pub fn install(ctx: &egui::Context, t: &Tokens) {
     fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "jbmono".into());
     fonts.families.insert(FontFamily::Name("semibold".into()), vec!["inter-semibold".into(), "inter".into()]);
     fonts.families.insert(FontFamily::Name("medium".into()), vec!["inter-medium".into(), "inter".into()]);
+    for stack in fonts.families.values_mut() {
+        for face in SYMBOL_FALLBACKS {
+            if !stack.iter().any(|n| n == face) {
+                stack.push(face.into());
+            }
+        }
+    }
     // Japanese before Chinese: the two share code points, and Japanese text must keep Japanese
     // glyph forms; Chinese faces still cover the hanzi Japanese fonts lack
     add_craft_fonts(&mut fonts);
@@ -582,6 +594,29 @@ mod tests {
             });
         }
         // the layouts above put glyphs in the atlas: take that update so it isn't dropped unapplied
+        ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+    }
+
+    /// Symbols in interface text ("check Settings ▸ Audio Hardware" in the status bar, ✔ / ✖
+    /// results) render as glyphs, not the missing-glyph box, in every font family. Compares glyph
+    /// texture regions with the noncharacter U+10FFFF, which no face has.
+    #[test]
+    fn interface_symbols_render_in_every_font_family() {
+        const SYMBOLS: &str = "▸✔✖⚙⚡";
+        let ctx = installed();
+        ctx.fonts_mut(|fonts| {
+            for family in font_families() {
+                let font = FontId::new(11.0, family);
+                let galley = fonts.layout_no_wrap(format!("{SYMBOLS}\u{10ffff}"), font.clone(), Color32::WHITE);
+                let glyphs = &galley.rows[0].glyphs;
+                assert_eq!(glyphs.len(), SYMBOLS.chars().count() + 1);
+                let missing = glyphs[glyphs.len() - 1].uv_rect;
+                for glyph in &glyphs[..glyphs.len() - 1] {
+                    assert!(!glyph.uv_rect.is_nothing(), "empty {} in {font:?}", glyph.chr);
+                    assert_ne!(glyph.uv_rect, missing, "missing {} in {font:?}", glyph.chr);
+                }
+            }
+        });
         ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
     }
 
