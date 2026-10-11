@@ -78,6 +78,19 @@ pub struct Transcript {
     /// before FilmCraft did, or one brought in): its pauses are cut whole.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub laughs: Option<Vec<TimeRange>>,
+    /// Which of FilmCraft's looks at the audio the transcript has had ([`AUDIO_ANALYSIS`]); 0 for
+    /// one made before, or brought in. `transcript.analyzeAudio` brings an older one up to date.
+    #[serde(rename = "audioAnalysis", skip_serializing_if = "is_zero")]
+    pub audio_analysis: u32,
+}
+
+/// The current look at the audio behind a transcript (`filmcraft_speech::analyze_audio`): 1, the
+/// words fitted to their voice (a breath before or after a word is not part of it) and the laughs
+/// in the pauses found.
+pub const AUDIO_ANALYSIS: u32 = 1;
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 impl Transcript {
@@ -202,8 +215,10 @@ mod tests {
         assert_eq!(old.laughs, None);
         assert!(!serde_json::to_string(&old).unwrap().contains("laughs"));
         // one looked at and without laughs says so
-        let none = Transcript { laughs: Some(Vec::new()), ..Default::default() };
-        let back: Transcript = serde_json::from_str(&serde_json::to_string(&none).unwrap()).unwrap();
-        assert_eq!(back.laughs, Some(Vec::new()));
+        let none = Transcript { laughs: Some(Vec::new()), audio_analysis: AUDIO_ANALYSIS, ..Default::default() };
+        let json = serde_json::to_string(&none).unwrap();
+        assert!(json.contains("\"audioAnalysis\":1"), "{json}");
+        let back: Transcript = serde_json::from_str(&json).unwrap();
+        assert_eq!((back.laughs, back.audio_analysis), (Some(Vec::new()), AUDIO_ANALYSIS));
     }
 }

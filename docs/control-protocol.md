@@ -88,13 +88,13 @@ Text panel ▸ Transcript ([transcripts.md](transcripts.md)): `transcript.genera
 and stop it with `transcript.cancel`; `wait: true` (the default) returns when it is done.
 `transcript.search {filter: text|fillers|pauses, query?}`, `transcript.deleteAll {filter, query?, lift?}`,
 `transcript.select|extract|lift {from, to}` or `{pauseAfter}` (a pause keeps `keepAfterSeconds` /
-`keepBeforeSeconds` next to the words and a laugh in it), `transcript.findLaughs {wait: false}` for
-transcripts never looked at for laughs (`transcript.inspect` → `laughsChecked`). `ui.set {"transcript": {filter, current,
+`keepBeforeSeconds` next to the words and a laugh in it), `transcript.analyzeAudio {wait: false}` for
+transcripts made before FilmCraft's current look at their audio (`transcript.inspect` → `audioAnalyzed`). `ui.set {"transcript": {filter, current,
 lift, pause, caret, viewOptions}, "transcriptSearch": "…"}` merges into the tab's view
 state. UI ids: `text.transcript.generate`, `text.transcript.progress`, `text.transcript.cancel`,
 `text.transcript.search` (with a filter on, the pill naming it), `text.transcript.filter[.text|.fillers|.pauses|.searchSettings]`,
 `text.transcript.autoInOut`, `text.transcript.extract|lift`, `text.transcript.more[.createCaptions|.transcribe|.viewOptions|.autoScroll]`,
-`text.transcript.quick.fillers|pauses` ("Pauses (12)"), `text.transcript.findLaughs`, `text.transcript.count`, `text.transcript.prev|next`,
+`text.transcript.quick.fillers|pauses` ("Pauses (12)"), `text.transcript.analyzeAudio`, `text.transcript.count`, `text.transcript.prev|next`,
 `text.transcript.minPause[.less|.more]` (Pauses filter), `text.transcript.deleteAll|deleteOne`,
 `text.transcript.deleteMode.extract|lift`,
 `text.transcript.word.<i>`, `text.transcript.pause.<i>` (labelled as shown: "[... 1.9 s · laugh]"), `text.transcript.segment.<n>`; the Transcribe

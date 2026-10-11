@@ -540,11 +540,18 @@ impl Whisper {
         }
         words.sort_by_key(|w| w.0);
         let words = words.into_iter().flat_map(|w| w.1).collect();
-        let mut t = Transcript { language: language.unwrap_or_else(|| "en".into()), source: self.id.clone(), speakers: Vec::new(), words, laughs: None };
+        let mut t = Transcript {
+            language: language.unwrap_or_else(|| "en".into()),
+            source: self.id.clone(),
+            speakers: Vec::new(),
+            words,
+            laughs: None,
+            audio_analysis: 0,
+        };
         t.normalize();
         crate::vad::tighten_words_speech(&speech, &mut t.words);
-        // a laugh in a pause stays when the pause is deleted
-        t.laughs = Some(crate::laugh::laughs(audio, &t.words));
+        // words fitted to their voice, laughs in the pauses found
+        crate::analyze_audio(audio, &mut t);
         if opts.diarize && !t.words.is_empty() {
             if !progress(0.96, "Labelling speakers") {
                 return Err(SpeechError::Cancelled);

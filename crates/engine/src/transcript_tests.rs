@@ -434,7 +434,7 @@ fn a_laugh_in_a_pause_stays_when_the_pause_is_deleted() {
         (Tick(l["start"].as_i64().unwrap()), Tick(l["end"].as_i64().unwrap()))
     };
     let r = s.execute("transcript.inspect", json!({})).unwrap();
-    assert_eq!(r["laughsChecked"], true);
+    assert_eq!(r["audioAnalyzed"], false, "brought in: never looked at");
     assert_eq!(r["pauses"][0]["after"], 2);
     assert_eq!(r["pauses"][0]["laughs"].as_array().map(Vec::len), Some(1), "{}", r["pauses"]);
     let (l0, l1) = laugh_at(&mut s);
@@ -470,29 +470,33 @@ fn a_laugh_in_a_pause_stays_when_the_pause_is_deleted() {
     assert_eq!(r["matches"][0]["laughs"].as_array().map(Vec::len), Some(1));
 }
 
-/// Transcripts made before FilmCraft looked for laughs cut a pause whole; Find Laughs looks in
-/// their audio (the words stay), in one undo step.
+/// Transcripts made before FilmCraft's current look at the audio may hold a breath in a word and
+/// cut a laugh in a pause; Analyze Audio looks (the words' text stays, their bounds fit the voice),
+/// in one undo step.
 #[test]
-fn finding_laughs_in_an_old_transcript_keeps_its_words() {
+fn analyzing_the_audio_of_an_old_transcript_keeps_its_words() {
     let (mut s, item, _) = session();
-    assert!(s.execute("transcript.findLaughs", json!({})).is_err(), "nothing transcribed yet");
+    assert!(s.execute("transcript.analyzeAudio", json!({})).is_err(), "nothing transcribed yet");
     s.execute("transcript.generate", json!({"items": [item.0]})).unwrap();
-    assert_eq!(s.project.transcripts[&item].laughs, None);
-    assert_eq!(s.execute("transcript.inspect", json!({})).unwrap()["laughsChecked"], false);
-    let words_before = s.project.transcripts[&item].words.clone();
-    let r = s.execute("transcript.findLaughs", json!({})).unwrap();
+    assert_eq!((s.project.transcripts[&item].laughs.as_ref(), s.project.transcripts[&item].audio_analysis), (None, 0));
+    assert_eq!(s.execute("transcript.inspect", json!({})).unwrap()["audioAnalyzed"], false);
+    let text = |s: &Session| s.project.transcripts[&item].words.iter().map(|w| w.text.clone()).collect::<Vec<_>>();
+    let words_before = text(&s);
+    let r = s.execute("transcript.analyzeAudio", json!({})).unwrap();
     assert_eq!(r["items"][0]["item"], item.0, "{r}");
     assert!(r["items"][0]["laughs"].is_u64(), "{r}");
     let t = s.project.transcripts[&item].clone();
     assert!(t.laughs.is_some());
-    assert_eq!(t.words, words_before, "the words are the same");
-    assert_eq!(s.execute("transcript.inspect", json!({})).unwrap()["laughsChecked"], true);
-    assert_eq!(s.history.undo.last().map(|u| u.0.as_str()), Some("Find Laughs"));
+    assert_eq!(t.audio_analysis, filmcraft_project::transcript::AUDIO_ANALYSIS);
+    assert_eq!(text(&s), words_before, "the words are the same");
+    t.check().unwrap();
+    assert_eq!(s.execute("transcript.inspect", json!({})).unwrap()["audioAnalyzed"], true);
+    assert_eq!(s.history.undo.last().map(|u| u.0.as_str()), Some("Analyze Audio"));
     s.execute("edit.undo", json!({})).unwrap();
-    assert_eq!(s.project.transcripts[&item].laughs, None);
+    assert_eq!(s.project.transcripts[&item].audio_analysis, 0);
     // only transcribed items are looked at
     let other = s.project.items.values().find(|i| i.as_media().is_some() && i.id != item).map(|i| i.id).unwrap();
-    assert!(s.execute("transcript.findLaughs", json!({"items": [other.0]})).is_err());
+    assert!(s.execute("transcript.analyzeAudio", json!({"items": [other.0]})).is_err());
 }
 
 #[test]

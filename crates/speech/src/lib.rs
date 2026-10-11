@@ -45,6 +45,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use filmcraft_project::Transcript;
 use filmcraft_time::{TICKS_PER_SECOND, Tick};
 
+/// FilmCraft's look at the audio behind a transcript, after recognition (and for a transcript made
+/// before, `transcript.analyzeAudio`): the words fitted to their voice ([`vad::fit_words_to_voice`]),
+/// then the laughs in the pauses between them found ([`laugh::laughs`]). The words' text stays.
+pub fn analyze_audio(audio: &[f32], t: &mut Transcript) {
+    t.normalize();
+    vad::fit_words_to_voice(audio, &mut t.words);
+    t.normalize();
+    t.laughs = Some(laugh::laughs(audio, &t.words));
+    t.audio_analysis = filmcraft_project::transcript::AUDIO_ANALYSIS;
+}
+
 /// The sample rate every transcriber takes.
 pub const SAMPLE_RATE: u32 = 16_000;
 

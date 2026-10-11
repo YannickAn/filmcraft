@@ -138,9 +138,9 @@ enum Recogniser {
         dir: std::path::PathBuf,
         download: bool,
     },
-    /// `transcript.findLaughs`: no recognition; these transcripts keep their words and get the
-    /// laughs in their pauses.
-    FindLaughs(BTreeMap<ItemId, Arc<Transcript>>),
+    /// `transcript.analyzeAudio`: no recognition; these transcripts keep their words, fitted to
+    /// their voice, and get the laughs in their pauses.
+    Analyze(BTreeMap<ItemId, Arc<Transcript>>),
 }
 
 /// The recogniser for `transcript.generate`: the installed one, else the named catalogue model
@@ -193,7 +193,7 @@ pub struct Transcribed {
 /// it finishes. A cancelled job changes nothing.
 pub struct PendingTranscription {
     pub job: u64,
-    /// The undo step it makes ("Transcribe", "Find Laughs").
+    /// The undo step it makes ("Transcribe", "Analyze Audio").
     pub label: &'static str,
     pub items: Vec<ItemId>,
     /// The items' names when the job started: a transcript is only applied to the item it was
@@ -254,10 +254,10 @@ fn decode(w: &WorkItem, prog: &filmcraft_export::Progress, status: &str, base: f
     Ok(Some(out))
 }
 
-/// The body of a `transcript.findLaughs` job: decode each item and find the laughs in the pauses
-/// of its transcript ([`filmcraft_speech::laugh::laughs`]), which keeps its words. `Ok(None)`:
-/// cancelled.
-fn find_laughs_items(
+/// The body of a `transcript.analyzeAudio` job: decode each item and look at its audio as a
+/// transcription does ([`filmcraft_speech::analyze_audio`]: the words fitted to their voice, the
+/// laughs in the pauses found); the words' text stays. `Ok(None)`: cancelled.
+fn analyze_items(
     existing: &BTreeMap<ItemId, Arc<Transcript>>,
     work: &[WorkItem],
     prog: &filmcraft_export::Progress,
@@ -267,13 +267,12 @@ fn find_laughs_items(
     let mut out = Vec::new();
     for w in work {
         let share = w.samples as f64 / total;
-        let status = format!("Looking for laughs in {}", w.name);
+        let status = format!("Analyzing the audio of {}", w.name);
         let Some(audio) = decode(w, prog, &status, base, share)? else { return Ok(None) };
         base += share;
         let Some(t) = existing.get(&w.item) else { continue };
         let mut t = (**t).clone();
-        t.laughs = Some(filmcraft_speech::laugh::laughs(&audio, &t.words));
-        t.normalize();
+        filmcraft_speech::analyze_audio(&audio, &mut t);
         out.push((w.item, t));
     }
     Ok(Some(out))
@@ -288,7 +287,7 @@ fn transcribe_items(
     prog: &filmcraft_export::Progress,
 ) -> std::result::Result<Option<Vec<(ItemId, Transcript)>>, String> {
     let t = match rec {
-        Recogniser::FindLaughs(existing) => return find_laughs_items(&existing, work, prog),
+        Recogniser::Analyze(existing) => return analyze_items(&existing, work, prog),
         Recogniser::Installed(t) => t,
         Recogniser::Model { model, dir, download } => {
             if !filmcraft_speech::models::installed(&dir, model) {
@@ -338,10 +337,12 @@ fn generate(s: &mut Session, p: &Value) -> Result<Value> {
     start(s, p, false)
 }
 
-/// `transcript.findLaughs`: find the laughs in the pauses of transcripts made before FilmCraft
-/// looked for them, so deleting a pause keeps the laugh; the words stay. Much quicker than
+/// `transcript.analyzeAudio`: look at the audio of transcripts made before FilmCraft's current
+/// look ([`filmcraft_project::transcript::AUDIO_ANALYSIS`]): their words are fitted to their voice
+/// (a deleted pause is cut where the voice stops and starts, not at a breath) and the laughs in
+/// their pauses are found (deleting a pause keeps them); the words' text stays. Much quicker than
 /// transcribing again: the audio is decoded, nothing is recognised.
-fn find_laughs(s: &mut Session, p: &Value) -> Result<Value> {
+fn analyze_audio(s: &mut Session, p: &Value) -> Result<Value> {
     start(s, p, true)
 }
 
@@ -352,11 +353,11 @@ fn played_stream(s: &Session, item: ItemId) -> Option<usize> {
     q.audio_tracks.iter().flat_map(|t| t.items.iter()).find(|it| it.item == item && it.enabled).map(|it| it.audio_stream)
 }
 
-/// Start a transcription job (`laughs`: a `transcript.findLaughs` job).
-fn start(s: &mut Session, p: &Value, laughs: bool) -> Result<Value> {
-    let cmd = if laughs { "transcript.findLaughs" } else { "transcript.generate" };
+/// Start a transcription job (`analyze`: a `transcript.analyzeAudio` job).
+fn start(s: &mut Session, p: &Value, analyze: bool) -> Result<Value> {
+    let cmd = if analyze { "transcript.analyzeAudio" } else { "transcript.generate" };
     let mut items = targets(s, p);
-    if laughs {
+    if analyze {
         items.retain(|i| s.project.transcripts.contains_key(i));
         if items.is_empty() {
             return Err(bad(cmd, "nothing to look at: none of the clips is transcribed"));
@@ -368,11 +369,8 @@ fn start(s: &mut Session, p: &Value, laughs: bool) -> Result<Value> {
     if running_job(s).is_some() {
         return Err(EngineError::Other("a transcription is already running (transcript.cancel stops it)".into()));
     }
-    let rec = if laughs {
-        Recogniser::FindLaughs(items.iter().filter_map(|i| Some((*i, s.project.transcripts.get(i)?.clone()))).collect())
-    } else {
-        recogniser(s, p)?
-    };
+    let rec =
+        if analyze { Recogniser::Analyze(items.iter().filter_map(|i| Some((*i, s.project.transcripts.get(i)?.clone()))).collect()) } else { recogniser(s, p)? };
     // Settings ▸ Media Analysis & Transcription: language (or auto-detect) and speaker labelling
     let ma = &s.prefs.media_analysis;
     let default_language = if ma.language_auto_detect { None } else { Some(ma.default_language.clone()) };
@@ -398,7 +396,7 @@ fn start(s: &mut Session, p: &Value, laughs: bool) -> Result<Value> {
         // `audioStreams` {item: stream}: which audio stream of a multi-stream recording to listen to
         // (looking for laughs: the one the sequence plays, unless named)
         let named = p.get("audioStreams").and_then(|m| m.get(item.0.to_string())).and_then(Value::as_u64).map(|n| n as usize);
-        let stream = named.or_else(|| if laughs { played_stream(s, item) } else { None }).unwrap_or(0);
+        let stream = named.or_else(|| if analyze { played_stream(s, item) } else { None }).unwrap_or(0);
         let (Some(src), Some(name)) = (s.source(item).filter(|src| src.info().audio_streams.len() > stream), s.project.item(item).map(|i| i.name.clone()))
         else {
             skipped.push(item);
@@ -412,7 +410,7 @@ fn start(s: &mut Session, p: &Value, laughs: bool) -> Result<Value> {
         work.push(WorkItem { item, name, src, stream, samples: samples as usize });
     }
     if work.is_empty() {
-        return Err(EngineError::Other(format!("none of the clips has audio to {}", if laughs { "look at" } else { "transcribe" })));
+        return Err(EngineError::Other(format!("none of the clips has audio to {}", if analyze { "look at" } else { "transcribe" })));
     }
     let ids: Vec<ItemId> = work.iter().map(|w| w.item).collect();
     let names: Vec<String> = work.iter().map(|w| w.name.clone()).collect();
@@ -430,7 +428,7 @@ fn start(s: &mut Session, p: &Value, laughs: bool) -> Result<Value> {
             Ok(Some(transcripts)) => {
                 let words: usize = transcripts.iter().map(|(_, t)| t.words.len()).sum();
                 let found: usize = transcripts.iter().map(|(_, t)| t.laughs.as_ref().map_or(0, Vec::len)).sum();
-                let done = if laughs { format!("Found {found} laugh(s) ({secs:.1}s)") } else { format!("Transcribed {words} word(s) ({secs:.1}s)") };
+                let done = if analyze { format!("Analyzed: {found} laugh(s) ({secs:.1}s)") } else { format!("Transcribed {words} word(s) ({secs:.1}s)") };
                 report(&prog, done, 1.0);
                 *lock(&out) = Some(Transcribed { transcripts, skipped: skipped_items });
                 Ok(filmcraft_export::Report { path: String::new(), frames: words as u64, seconds: secs, bytes: 0, render_fps: 0.0, extra_files: Vec::new() })
@@ -452,7 +450,7 @@ fn start(s: &mut Session, p: &Value, laughs: bool) -> Result<Value> {
     s.jobs.push(job);
     s.transcribe_jobs.push(PendingTranscription {
         job: id,
-        label: if laughs { "Find Laughs" } else { "Transcribe" },
+        label: if analyze { "Analyze Audio" } else { "Transcribe" },
         items: ids.clone(),
         names,
         results: results.clone(),
@@ -519,7 +517,7 @@ pub fn poll(s: &mut Session) {
         }
         let words: usize = transcripts.iter().map(|(_, t)| t.words.len()).sum();
         let laughs: usize = transcripts.iter().map(|(_, t)| t.laughs.as_ref().map_or(0, Vec::len)).sum();
-        let looked_for_laughs = pending.label == "Find Laughs";
+        let analyzed = pending.label == "Analyze Audio";
         let r = s.edit(pending.label, move |pr, _| {
             for (i, t) in transcripts {
                 pr.transcripts.insert(i, Arc::new(t));
@@ -527,9 +525,10 @@ pub fn poll(s: &mut Session) {
             Ok(())
         });
         match r {
-            Ok(()) if looked_for_laughs => {
-                s.events.push(crate::Event::Toast { message: format!("Laughs found: {laughs}. Deleting a pause keeps the laugh in it"), error: false })
-            }
+            Ok(()) if analyzed => s.events.push(crate::Event::Toast {
+                message: format!("Audio analyzed: pauses are cut where the voice stops and starts; {laughs} laugh(s) found, they stay"),
+                error: false,
+            }),
             Ok(()) if words == 0 => s.toast("Transcription finished: no speech was found"),
             Ok(()) => s.events.push(crate::Event::Toast { message: format!("Transcription finished: {words} word(s)"), error: false }),
             Err(e) => s.error_toast("transcript.generate", format!("Transcription: {e}")),
@@ -641,10 +640,12 @@ pub fn sequence_laughs(s: &Session) -> Vec<TimeRange> {
     }
 }
 
-/// Whether every transcript the sequence transcript reads from was looked at for laughs (false:
-/// some pauses would be cut whole, laugh or not; `transcript.findLaughs` looks).
-pub fn laughs_checked(s: &Session, words: &[SeqWord]) -> bool {
-    words.iter().all(|w| s.project.transcripts.get(&w.item).is_none_or(|t| t.laughs.is_some()))
+/// Whether every transcript the sequence transcript reads from had FilmCraft's current look at its
+/// audio (false: some words may hold a breath, so a deleted pause stops short of the voice, and a
+/// laugh in a pause is cut; `transcript.analyzeAudio` looks).
+pub fn audio_analyzed(s: &Session, words: &[SeqWord]) -> bool {
+    use filmcraft_project::transcript::AUDIO_ANALYSIS;
+    words.iter().all(|w| s.project.transcripts.get(&w.item).is_none_or(|t| t.audio_analysis >= AUDIO_ANALYSIS))
 }
 
 /// The shortest silence shown and found as a pause: `minPauseSeconds`, else Transcript view
@@ -722,7 +723,7 @@ fn inspect(s: &mut Session, p: &Value) -> Result<Value> {
         "pauses": pauses.iter().map(|q| pause_json(q, &laughs)).collect::<Vec<_>>(),
         "minPauseSeconds": min.seconds(),
         "laughs": laughs.iter().map(|r| range_json(*r)).collect::<Vec<_>>(),
-        "laughsChecked": laughs_checked(s, &words),
+        "audioAnalyzed": audio_analyzed(s, &words),
         "speakers": speakers,
         "current": current,
         "currentPause": pauses.iter().find(|q| q.start <= ph && ph < q.end).map(|q| q.after),
@@ -1097,12 +1098,12 @@ pub fn commands() -> Vec<CommandSpec> {
             true,
         ),
         spec(
-            "transcript.findLaughs",
-            "Find Laughs in Pauses",
+            "transcript.analyzeAudio",
+            "Analyze Audio for Pauses",
             &[],
-            r#"{"items":[id]?,"audioStreams":{"<item>":n}?,"wait":bool=true} looks for laughs in the pauses of transcribed clips (deleting a pause keeps them); keeps the words"#,
+            r#"{"items":[id]?,"audioStreams":{"<item>":n}?,"wait":bool=true} fits the transcribed clips' words to their voice (pauses are cut where it stops and starts, not at a breath) and finds the laughs in their pauses (kept); keeps the words"#,
             has_transcripts,
-            find_laughs,
+            analyze_audio,
             true,
         ),
         spec("transcript.delete", "Delete Transcript", &["Sequence", "Transcript"], r#"{"items":[id]?}"#, has_transcripts, delete, true),

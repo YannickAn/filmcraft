@@ -7,8 +7,7 @@
 //! A laugh differs from other sound in a pause by two things a cough or a breath lacks:
 //!
 //! - it is **voiced**: the vocal folds vibrate as on a vowel, so the waveform repeats with a pitch
-//!   period of 1.25–14 ms (about 70–800 Hz, a laugh goes high; normalised autocorrelation of at
-//!   least 0.5 over 30 ms);
+//!   period ([`crate::vad::periodicity`] of at least 0.5);
 //! - it comes in **pulses** ("ha-ha-ha"): level peaks at least 6 dB above the dips on both sides,
 //!   100–400 ms apart.
 //!
@@ -18,12 +17,17 @@
 //! burst of noise (unvoiced; in a fit, the bursts are further apart), a breath is quiet noise, a
 //! click is a single short burst. A single voiced "hm" or "ha" is one pulse and stays part of the
 //! pause; the recogniser usually writes those as words anyway.
+//!
+//! The laugh kept is its voice, from the first voiced frame to the last, with the soft sound joined
+//! to them as a word has it ([`crate::vad::fit_words_to_voice`]: at most 150 ms before, 120 ms
+//! after): the breath drawn after a laugh goes with the pause. Look for laughs once the words are
+//! fitted to their voice, so a word's own sound is not in a gap.
 
 use filmcraft_project::Word;
 use filmcraft_time::{Tick, TimeRange};
 
 use crate::TICKS_PER_SAMPLE;
-use crate::vad::{edge_threshold, frame_db, threshold};
+use crate::vad::{edge_threshold, frame_centre, frame_db, periodicity, threshold};
 
 /// 10 ms frames of 16 kHz audio.
 const FRAME: usize = 160;
@@ -36,13 +40,15 @@ const PULSE_PROMINENCE_DB: f32 = 6.0;
 /// Consecutive pulses of a laugh lie 100–400 ms apart (frames).
 const MIN_PULSE_GAP: usize = 10;
 const MAX_PULSE_GAP: usize = 40;
-/// Normalised autocorrelation at the pitch period from which a pulse counts as voiced.
+/// Normalised autocorrelation at the pitch period from which a pulse counts as voiced (a laugh is
+/// breathier than a vowel).
 const VOICED: f32 = 0.5;
-/// Pitch periods looked at: 800 Hz down to about 70 Hz (samples).
-const MIN_LAG: usize = 20;
-const MAX_LAG: usize = 228;
-/// The stretch of waveform compared with itself one period later (30 ms).
-const WINDOW: usize = 480;
+/// The soft sound joined to a laugh's voice: as long (frames) and as loud (dB below its loudest
+/// frame) as a word's ([`crate::vad`]).
+const SOFT_START: usize = 15;
+const SOFT_END: usize = 12;
+const SOFT_START_DB: f32 = 35.0;
+const SOFT_END_DB: f32 = 30.0;
 
 /// The laughs in the gaps between `words` (and before the first and after the last word) of
 /// `audio` (16 kHz mono), in media time, in order. See the module docs.
@@ -72,8 +78,11 @@ pub fn laughs(audio: &[f32], words: &[Word]) -> Vec<TimeRange> {
         }
         for (s, e) in sound_runs(&db, a, b, edge) {
             let peak = db.get(s..e).into_iter().flatten().copied().fold(f32::NEG_INFINITY, f32::max);
-            if peak >= th && is_laugh(audio, &db, s, e) {
-                out.push(TimeRange::from_bounds(tick(s), tick(e)));
+            if peak >= th
+                && is_laugh(audio, &db, s, e)
+                && let Some((ls, le)) = voice_of(audio, &db, s, e, th, edge)
+            {
+                out.push(TimeRange::from_bounds(tick(ls), tick(le)));
             }
         }
     }
@@ -99,6 +108,26 @@ fn sound_runs(db: &[f32], a: usize, b: usize, edge: f32) -> Vec<(usize, usize)> 
         }
     }
     runs
+}
+
+/// The laugh's voice in frames `s..e`: first to last voiced frame, widened by the soft sound joined
+/// to them (see the module docs).
+fn voice_of(audio: &[f32], db: &[f32], s: usize, e: usize, th: f32, edge: f32) -> Option<(usize, usize)> {
+    let level = |f: usize| db.get(f).copied().unwrap_or(f32::NEG_INFINITY);
+    let voiced = |f: usize| level(f) >= th && periodicity(audio, frame_centre(f)) >= VOICED;
+    let f0 = (s..e).find(|&f| voiced(f))?;
+    let f1 = (f0..e).rev().find(|&f| voiced(f))?;
+    let peak = (f0..=f1).map(level).fold(f32::NEG_INFINITY, f32::max);
+    let (soft_start, soft_end) = (edge.max(peak - SOFT_START_DB), edge.max(peak - SOFT_END_DB));
+    let mut a = f0;
+    while a > s && f0 - a < SOFT_START && level(a - 1) >= soft_start {
+        a -= 1;
+    }
+    let mut b = f1 + 1;
+    while b < e && b - (f1 + 1) < SOFT_END && level(b) >= soft_end {
+        b += 1;
+    }
+    Some((a, b))
 }
 
 /// Whether frames `s..e` hold two consecutive voiced pulses 100–400 ms apart.
@@ -147,32 +176,7 @@ fn pulses(db: &[f32], s: usize, e: usize) -> Vec<usize> {
 
 /// Whether the waveform around frame `f` (or the frames next to it) is voiced.
 fn voiced_near(audio: &[f32], f: usize) -> bool {
-    [f.saturating_sub(1), f, f.saturating_add(1)].iter().any(|&g| periodicity(audio, g.saturating_mul(FRAME).saturating_add(FRAME / 2)) >= VOICED)
-}
-
-/// The best normalised autocorrelation of the 30 ms of `audio` around sample `centre` with itself
-/// one pitch period (1.25–14 ms) later; 0 where too little audio is left.
-fn periodicity(audio: &[f32], centre: usize) -> f32 {
-    let start = centre.saturating_sub(WINDOW / 2);
-    let Some(x) = audio.get(start..start.saturating_add(WINDOW + MAX_LAG)) else { return 0.0 };
-    let mean = x.iter().sum::<f32>() / x.len().max(1) as f32;
-    let x: Vec<f32> = x.iter().map(|v| v - mean).collect();
-    let Some(head) = x.get(..WINDOW) else { return 0.0 };
-    let e0: f32 = head.iter().map(|v| v * v).sum();
-    let mut best = 0.0f32;
-    for lag in MIN_LAG..=MAX_LAG {
-        let Some(later) = x.get(lag..lag + WINDOW) else { break };
-        let (mut num, mut e1) = (0.0f32, 0.0f32);
-        for (a, b) in head.iter().zip(later) {
-            num += a * b;
-            e1 += b * b;
-        }
-        let den = (e0 * e1).sqrt();
-        if den > 1e-12 {
-            best = best.max(num / den);
-        }
-    }
-    best
+    [f.saturating_sub(1), f, f.saturating_add(1)].iter().any(|&g| periodicity(audio, frame_centre(g)) >= VOICED)
 }
 
 #[cfg(test)]
@@ -265,16 +269,17 @@ mod tests {
     fn a_laugh_between_words_is_found_and_a_cough_a_breath_and_a_click_are_not() {
         let mut audio = room(at(7.0));
         let words = speak(&mut audio, &[(0.3, 1.0), (2.6, 3.2), (5.6, 6.4)]);
-        // between the first two words: a laugh 1.4–2.15
+        // between the first two words: a laugh 1.4–2.15, then a breath drawn 2.2–2.5
         let end = laugh(&mut audio, at(1.4));
         assert_eq!(end, at(2.15));
+        add(&mut audio, at(2.2), &noise(at(0.3), 0.01, 11));
         // between the next two: a cough at 3.5, a breath 4.1–4.6, a click at 5.0
         cough(&mut audio, at(3.5));
         add(&mut audio, at(4.1), &noise(at(0.5), 0.01, 5));
         add(&mut audio, at(5.0), &[0.6, -0.5, 0.4, -0.3, 0.2]);
         let found = laughs(&audio, &words);
         assert_eq!(found.len(), 1, "{found:?}");
-        assert!(near(&found[0], 1.4, 2.15), "{found:?}");
+        assert!(near(&found[0], 1.4, 2.15), "the laugh without the breath after it: {found:?}");
         // the laugh is four voiced pulses
         let db = frame_db(&audio);
         let p = pulses(&db, 140, 215);

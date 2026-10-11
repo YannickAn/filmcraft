@@ -3538,9 +3538,9 @@
 	Keep before words	Conservar antes de las palabras
 	laugh	risa
 	The laugh in it stays when the pause is deleted	La risa que contiene se conserva al eliminar la pausa
-	Find laughs	Buscar risas
-	Look for laughs in the pauses, so deleting a pause keeps them (the words stay)	Buscar risas en las pausas para que se conserven al eliminar una pausa (las palabras se mantienen)
-	Find Laughs in Pauses	Buscar risas en las pausas
+	Analyze audio	Analizar el audio
+	Fit the words to the voice and find the laughs in the pauses: a deleted pause is cut where the voice stops and starts, and a laugh stays (the words stay)	Ajustar las palabras a la voz y buscar las risas en las pausas: una pausa eliminada se corta donde la voz se detiene y empieza, y la risa se conserva (las palabras se mantienen)
+	Analyze Audio for Pauses	Analizar el audio para las pausas
 	Minimum pause length	Duración mínima de pausa
 	More options	Más opciones
 	Next result	Resultado siguiente

@@ -7,8 +7,8 @@
 //! `cancel`; toolbar `search` (with a filter on: the pill naming it, a click goes back to text),
 //! `filter` (menu `filter.text|fillers|pauses|searchSettings`), `autoInOut`, `extract`, `lift`,
 //! `more` (menu `more.createCaptions|transcribe|viewOptions|autoScroll`); quick filters
-//! `quick.fillers|pauses` ("Pauses (12)"), `findLaughs` (a transcript never looked at for laughs:
-//! its pauses would be cut whole); results row `count`, `prev`, `next`, with the Pauses
+//! `quick.fillers|pauses` ("Pauses (12)"), `analyzeAudio` (a transcript made before FilmCraft's
+//! current look at its audio: a breath may be in a word, a laugh in a pause would be cut); results row `count`, `prev`, `next`, with the Pauses
 //! filter `minPause` and `minPause.less|more`; delete row `deleteAll`, `deleteOne`,
 //! `deleteMode.extract|lift`; text `segment.<n>`, `word.<i>`, `pause.<i>` (the pause after word i).
 //! The Transcript View Options dialog:
@@ -119,10 +119,11 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let all_pauses = tx::pauses(&words, min_pause);
     let filler_list = filmcraft_engine::transcript::filler_hits(&app.session, &words, &json!({}));
     let row = Rect::from_min_size(pos2(rect.min.x + 10.0, y), vec2(rect.width() - 20.0, 22.0));
-    // a transcript never looked at for laughs: deleting its pauses would cut a laugh in them
-    let unchecked = job.is_none() && !filmcraft_engine::transcript::laughs_checked(&app.session, &words);
+    // a transcript made before FilmCraft's current look at its audio: a breath may hold a word's
+    // edge out in a pause, and a laugh in a pause would be cut
+    let unchecked = job.is_none() && !filmcraft_engine::transcript::audio_analyzed(&app.session, &words);
     if quick_filters(app, ui, row, filler_list.len(), all_pauses.len(), unchecked) {
-        actions.push(("transcript.findLaughs".into(), json!({"wait": false})));
+        actions.push(("transcript.analyzeAudio".into(), json!({"wait": false})));
     }
     y = row.max.y + 6.0;
 
@@ -631,7 +632,7 @@ fn toolbar(app: &mut FilmcraftApp, ui: &mut egui::Ui, bar: Rect, actions: &mut V
 
 /// Quick filters under the toolbar: "Filler words (3)" and "Pauses (12)" switch the search to that
 /// filter (a second click goes back to searching text), so finding every pause is one click and
-/// shows how many there are. With `unchecked`, "Find laughs" follows them; returns whether it was
+/// shows how many there are. With `unchecked`, "Analyze audio" follows them; returns whether it was
 /// clicked.
 fn quick_filters(app: &mut FilmcraftApp, ui: &mut egui::Ui, row: Rect, fillers: usize, pauses: usize, unchecked: bool) -> bool {
     let t = app.tokens;
@@ -664,19 +665,19 @@ fn quick_filters(app: &mut FilmcraftApp, ui: &mut egui::Ui, row: Rect, fillers: 
     if !unchecked {
         return false;
     }
-    let label = tl!("Find laughs");
+    let label = tl!("Analyze audio");
     let galley = ui.painter().layout_no_wrap(label.to_string(), Tokens::ui(12.0), t.accent);
     let r = Rect::from_min_size(pos2(x + 6.0, row.min.y), vec2(galley.size().x + 20.0, row.height()));
     if r.max.x > row.max.x {
         return false;
     }
-    let resp = ui.interact(r, egui::Id::new("transcript-find-laughs"), Sense::click());
+    let resp = ui.interact(r, egui::Id::new("transcript-analyze-audio"), Sense::click());
     let p = ui.painter();
     p.rect_filled(r, r.height() / 2.0, if resp.hovered() { t.hover } else { t.field_bg });
     p.rect_stroke(r, r.height() / 2.0, Stroke::new(1.0, t.accent), egui::StrokeKind::Inside);
     p.galley(pos2(r.min.x + 10.0, r.center().y - galley.size().y / 2.0), galley, t.accent);
-    app.auto.add("text.transcript.findLaughs", r, label);
-    resp.on_hover_text(tl!("Look for laughs in the pauses, so deleting a pause keeps them (the words stay)")).clicked()
+    app.auto.add("text.transcript.analyzeAudio", r, label);
+    resp.on_hover_text(tl!("Fit the words to the voice and find the laughs in the pauses: a deleted pause is cut where the voice stops and starts, and a laugh stays (the words stay)")).clicked()
 }
 
 /// The results row: "3/33 results" with ∧ ∨ next to it; with the Pauses filter, the shortest pause

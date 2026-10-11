@@ -485,21 +485,21 @@ fn quick_filters_find_and_delete_every_pause_in_one_click() {
     assert!(d.ids("text.transcript.deleteAll").is_empty(), "no Delete row without a search");
 }
 
-/// A transcript never looked at for laughs (an old one, or one an agent set) would cut a laugh in a
-/// pause; "Find laughs" looks for them in the audio, keeps the words, and goes away. A pause with
-/// a laugh in it says so, and deleting it keeps the laugh.
+/// A transcript made before FilmCraft's current look at its audio (an old one, or one an agent set)
+/// may hold a breath in a word and would cut a laugh in a pause; "Analyze audio" looks, keeps the
+/// words, and goes away. A pause with a laugh in it says so, and deleting it keeps the laugh.
 #[test]
-fn find_laughs_and_a_pause_with_a_laugh() {
+fn analyze_audio_and_a_pause_with_a_laugh() {
     let mut d = Driver::transcript_tab();
     d.set_transcript();
-    assert_eq!(d.exec("transcript.inspect", json!({}))["laughsChecked"], false);
-    assert_eq!(d.label("text.transcript.findLaughs"), "Find laughs");
+    assert_eq!(d.exec("transcript.inspect", json!({}))["audioAnalyzed"], false);
+    assert_eq!(d.label("text.transcript.analyzeAudio"), "Analyze audio");
     let undo = d.app().session.history.undo.len();
-    d.click("text.transcript.findLaughs");
-    d.until("the laughs looked for", |d| d.app().session.project.transcripts.values().all(|t| t.laughs.is_some()));
+    d.click("text.transcript.analyzeAudio");
+    d.until("the audio analyzed", |d| d.app().session.project.transcripts.values().all(|t| t.audio_analysis > 0));
     d.frames(3);
-    assert_eq!(d.exec("transcript.inspect", json!({}))["laughsChecked"], true);
-    assert!(d.ids("text.transcript.findLaughs").is_empty(), "nothing left to look at");
+    assert_eq!(d.exec("transcript.inspect", json!({}))["audioAnalyzed"], true);
+    assert!(d.ids("text.transcript.analyzeAudio").is_empty(), "nothing left to look at");
     assert_eq!(d.words().len(), WORDS.len(), "the words are kept");
     assert_eq!(d.app().session.history.undo.len(), undo + 1, "one undo step");
     // a laugh 2.6–3.0 s in the 1.1 s pause after "friend." (as a recogniser would find it)
@@ -616,7 +616,7 @@ fn transcript_panel_screenshots() {
     d.click("text.transcript.more.viewOptions");
     d.snapshot("view-options", Some(egui::Id::new("transcript-view-options")));
     d.click("transcriptViewOptions.cancel");
-    // a pause with a laugh in it (the transcript above was never looked at: "Find laughs" shows)
+    // a pause with a laugh in it (the transcript above was never analyzed: "Analyze audio" shows)
     d.ok("ui.set", json!({"transcriptSearch": ""}));
     d.set_transcript_with_laughs(Some(&[(2.6, 3.0)]));
     d.snapshot("laugh-in-pause", None);

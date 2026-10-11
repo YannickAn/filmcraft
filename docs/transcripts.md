@@ -19,9 +19,10 @@ Extract and Lift for the text selection, and "•••".
 
 **Quick filters** (FilmCraft): under the toolbar, "Filler words (2)" and "Pauses (12)" turn that
 filter on in one click (again: back to text) and say how many there are before anything is
-searched. Premiere has only the filter menu. After them, "Find laughs" shows while a transcript in
-the sequence was never looked at for laughs (see *A laugh in a pause stays* below); a click looks
-in the background and keeps the words.
+searched. Premiere has only the filter menu. After them, "Analyze audio" shows while a transcript
+in the sequence was made before FilmCraft's current look at its audio (see *Words end where the
+voice does* and *A laugh in a pause stays* below); a click looks in the background and keeps the
+words.
 
 | Where | Premiere | FilmCraft |
 |---|---|---|
@@ -68,15 +69,25 @@ text ("00:00:02:22 - 00:00:05:08"); the speaker column is hidden while speakers 
   0.08 s before the word after it (Keep before words): speech recognition can place a soft first
   sound ("s", "f", "h") a few tens of milliseconds late, and cutting right up to it took the start
   off words. A 1.2 s pause becomes about 0.15 s; one too short to leave that much is not deleted.
+- **Words end where the voice does** (FilmCraft): a recogniser often starts a word in the breath
+  drawn before it, or ends it in the breath let out after it, and a deleted pause then stopped well
+  short of the voice. When a clip is transcribed, each word is fitted to its voice
+  (`filmcraft_speech::vad::fit_words_to_voice`): from its first voiced moment (the voice sounds, as
+  on a vowel; breath is only noise) to its last, with the soft sound joined to them without a gap
+  (a soft "s", "f", "h" at most 150 ms before, a final "s" or a fading end at most 120 ms after, a
+  "t" released after its closure). So the cut lands next to the voice on both sides of a pause, and
+  a breath with a gap before the voice goes with the pause.
 - **A laugh in a pause stays** (FilmCraft): when a clip is transcribed, FilmCraft looks at the
   sound in the pauses between its words (`filmcraft_speech::laugh`). A laugh is voiced (the voice
   sounds, as on a vowel) and comes in pulses ("ha-ha-ha", 100–400 ms apart); a cough, clearing
   the throat, a breath or a click is not, and goes with the pause. Deleting a pause with a laugh in
-  it cuts the silence before and after the laugh (keeping the same 0.05 s after each sound and
-  0.08 s ahead of each) and the laugh plays whole. A single "ha" or "hm" counts as no laugh.
-  Transcripts made before this, or brought with `transcript.set` without `laughs`, were never
-  looked at: their pauses are cut whole until "Find laughs" (or `transcript.findLaughs`) looks;
-  transcribing again does too.
+  it cuts the silence before and after the laugh's voice (keeping the same 0.05 s after each sound
+  and 0.08 s ahead of each; the breath drawn after a laugh goes) and the laugh plays whole. A
+  single "ha" or "hm" counts as no laugh.
+- Transcripts made before this, or brought with `transcript.set` (unless they carry `laughs` and
+  `audioAnalysis`), had no such look: a breath may hold a word's edge out in a pause and a laugh in
+  a pause is cut, until "Analyze audio" (or `transcript.analyzeAudio`) looks; transcribing again
+  does too.
 - Delete or Backspace with text or a pause selected **extracts** it (ripple delete, gaps close);
   Alt+Backspace **lifts** it (leaves a gap). Ctrl/Cmd+F goes to the search field; ← → ↑ ↓,
   Home / End (with Shift to extend) move the playhead word by word as in Premiere.
@@ -111,10 +122,10 @@ to Out point only", the source-clip transcript in the Source monitor, and "Follo
 | `transcript.generate` | Transcribe media items (`items`, else the Project selection, else the media of the sequence's audio clips). Params: `model` (default: Settings ▸ Speech model, `parakeet-tdt-0.6b-v3`; also `parakeet-tdt-0.6b-v2`, `whisper-tiny`/`-base`/`-small`/`-large-v3-turbo`/`-large-v3`), `language` (`auto` = detect), `diarize`, `maxSpeakers`, `download` (fetch a missing model first; otherwise a missing model is an error naming its size and licence), `wait` (default `true`: return when done with the per-item report; `false`: start a background job and return `{job, items, running}`). One undo step ("Transcribe") when it finishes; a cancelled or failed job changes nothing. |
 | `transcript.status` / `transcript.cancel` | The running transcription (`progress` 0–1, `status`, `etaSeconds`, `items`) or `{"running": false}` / stop it (`jobs.list` and `jobs.cancel` see the same job, label "Transcription"). |
 | `sequence.transcribe` | Sequence ▸ Transcribe Sequence…: `transcript.generate` on the audio of `track` — `mix` (every audio track), `dialogue` (clips with the Essential Sound type Dialogue) or one track (`A1`) — with the same `language`, `model`, `download` and `wait`. |
-| `transcript.set` | Store a transcript you bring (JSON: `language`, `speakers`, `words` with `text`/`start`/`end`/`speaker`, optionally `laughs` as `{start, duration}` media-time ranges); it is sorted and made well formed. |
-| `transcript.findLaughs` | Look for laughs in the pauses of transcribed items (`items` chosen as for `transcript.generate`, of them the transcribed ones; `audioStreams`, default the one the sequence plays), so deleting a pause keeps them; the words stay. Decodes only, nothing is recognised. `wait` as `transcript.generate`; one undo step ("Find Laughs"); returns per item the number of `laughs`. |
+| `transcript.set` | Store a transcript you bring (JSON: `language`, `speakers`, `words` with `text`/`start`/`end`/`speaker`, optionally `laughs` as `{start, duration}` media-time ranges and `audioAnalysis`); it is sorted and made well formed. |
+| `transcript.analyzeAudio` | Look at the audio of transcribed items as a transcription does (`items` chosen as for `transcript.generate`, of them the transcribed ones; `audioStreams`, default the one the sequence plays): the words are fitted to their voice and the laughs in their pauses found; the words' text stays. Decodes only, nothing is recognised. `wait` as `transcript.generate`; one undo step ("Analyze Audio"); returns per item the number of `laughs`. |
 | `transcript.delete` | Remove transcripts. |
-| `transcript.inspect` | The sequence transcript: words (index, text, sequence times, speaker, clip, `filler`), paragraphs, `pauses` (`after`, `start`, `end`, `seconds`, `laughs` when one is in it; at least `minPauseSeconds`, default Transcript view options ▸ Minimum pause length), `laughs` (sequence time), `laughsChecked` (every transcript was looked at for laughs), speakers, the word (`current`) or pause (`currentPause`) at the playhead. |
+| `transcript.inspect` | The sequence transcript: words (index, text, sequence times, speaker, clip, `filler`), paragraphs, `pauses` (`after`, `start`, `end`, `seconds`, `laughs` when one is in it; at least `minPauseSeconds`, default Transcript view options ▸ Minimum pause length), `laughs` (sequence time), `audioAnalyzed` (every transcript had FilmCraft's current look at its audio), speakers, the word (`current`) or pause (`currentPause`) at the playhead. |
 | `transcript.search` | Matches of a search: `filter` `text` (a phrase in `query`; punctuation ignored; the last word may be a prefix unless `wholeWords`; case ignored unless `matchCase`; both default to Search settings), `fillers` (word ranges) or `pauses` (`pauseAfter`, `laughs`). Returns `count` and `matches`. |
 | `transcript.deleteAll` | Remove every match of a search (same params) in one undo step: Extract (ripple, default) or `lift: true`. A pause goes less `keepAfterSeconds` after the sound before it and `keepBeforeSeconds` ahead of the sound after it (defaults Transcript view options ▸ Keep after words, 0.05 s, and Keep before words, 0.08 s; `keepSeconds` sets both; 0 removes the whole gap); a laugh in it stays. |
 | `transcript.select` | Mark In/Out around words `from..=to` (frame-snapped outward) or the pause `pauseAfter` (less what is kept next to the words, as `transcript.deleteAll`, frame-snapped inward) and move the playhead there. |

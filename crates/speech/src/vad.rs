@@ -18,6 +18,18 @@
 //! the frames above the threshold into adjacent frames above a lower edge threshold
 //! ([`edge_threshold`]: 12 % of the way from the floor to the speech level, at least 4.5 dB above
 //! the floor), by at most 200 ms on each side ([`grow_speech`]).
+//!
+//! Breath is louder than both thresholds too: an inhale before a sentence or an exhale after it
+//! held a word's edge out in the pause, so a deleted pause left the breath and the cut sat well off
+//! where the voice starts or stops. [`fit_words_to_voice`] then fits each word to its **voice**: it
+//! starts at its first voiced frame (the waveform repeats with a pitch period, as on a vowel;
+//! breath is noise) and ends at its last, each widened by the unvoiced sound joined to it without a
+//! gap, at most 150 ms before (a soft "s", "f", "sch", "h", the burst of "t") and 120 ms after (a
+//! final "s" or "f", a fading end): sound no quieter than 35 dB below the word's loudest frame, or
+//! a hiss ("s", "f", "sch": mostly high frequencies, so the waveform crosses zero often, unlike
+//! breath) no quieter than 45 dB below it. A final stop released after its closure (the t of "ist",
+//! a burst of up to 60 ms within 150 ms) stays in the word. An inhale with a gap before the voice,
+//! or longer than that, is no longer part of the word, and goes when the pause is deleted.
 
 use filmcraft_project::Word;
 
@@ -31,6 +43,33 @@ const MIN_SPEECH_RUN: usize = 4;
 const NEAR_SPEECH: usize = 15;
 /// How far (10 ms frames) speech grows into a soft edge ([`grow_speech`]).
 const MAX_EDGE_FRAMES: usize = 20;
+/// How far (frames) past its recognised bounds a word's voice is looked for ([`fit_words_to_voice`];
+/// never past the middle of the gap to a neighbour).
+const VOICE_SEARCH: usize = 15;
+/// Unvoiced sound joined to a word's first voiced frame belongs to it for at most this long
+/// (frames)...
+const SOFT_START: usize = 15;
+/// ...and to its last one.
+const SOFT_END: usize = 12;
+/// ...when it is at most this far (dB) below the word's loudest frame...
+const SOFT_DB: f32 = 35.0;
+/// ...or a hiss ([`HISS_ZCR`]) at most this far.
+const HISS_DB: f32 = 45.0;
+/// Zero crossings per sample from which a frame is a hiss ("s", "f", "sch"; energy mostly above
+/// about 3 kHz) rather than breath.
+const HISS_ZCR: f32 = 0.35;
+/// A final stop released after its closure: a burst at most this long (frames)...
+const RELEASE_FRAMES: usize = 6;
+/// ...starting at most this long (frames) after the word's sound.
+const CLOSURE_FRAMES: usize = 15;
+/// A frame is voiced when its waveform repeats this well one pitch period later ([`periodicity`]).
+const VOICED: f32 = 0.6;
+/// Pitch periods looked at: 500 Hz down to about 70 Hz (samples; a higher voice repeats at twice
+/// its period too).
+const MIN_LAG: usize = 32;
+const MAX_LAG: usize = 228;
+/// The stretch of waveform compared with itself one period later (30 ms).
+const WINDOW: usize = 480;
 
 /// Frame levels in dBFS (10 ms RMS).
 pub fn frame_db(audio: &[f32]) -> Vec<f32> {
@@ -192,6 +231,109 @@ pub fn tighten_words_speech(speech: &[bool], words: &mut [Word]) {
     }
 }
 
+/// The best normalised autocorrelation of the 30 ms of `audio` (16 kHz) around sample `centre`
+/// with itself one pitch period (2–14 ms) later: near 1 where the voice sounds (a vowel, a voiced
+/// laugh), low for noise (breath, "s", "f", a cough); 0 where too little audio is left.
+pub fn periodicity(audio: &[f32], centre: usize) -> f32 {
+    let start = centre.saturating_sub(WINDOW / 2);
+    let Some(x) = audio.get(start..start.saturating_add(WINDOW + MAX_LAG)) else { return 0.0 };
+    let mean = x.iter().sum::<f32>() / x.len().max(1) as f32;
+    let x: Vec<f32> = x.iter().map(|v| v - mean).collect();
+    let Some(head) = x.get(..WINDOW) else { return 0.0 };
+    let e0: f32 = head.iter().map(|v| v * v).sum();
+    let mut best = 0.0f32;
+    for lag in MIN_LAG..=MAX_LAG {
+        let Some(later) = x.get(lag..lag + WINDOW) else { break };
+        let (mut num, mut e1) = (0.0f32, 0.0f32);
+        for (a, b) in head.iter().zip(later) {
+            num += a * b;
+            e1 += b * b;
+        }
+        let den = (e0 * e1).sqrt();
+        if den > 1e-12 {
+            best = best.max(num / den);
+        }
+    }
+    best
+}
+
+/// Zero crossings per sample of 10 ms frame `f` (0 past the end).
+pub(crate) fn zero_crossings(audio: &[f32], f: usize) -> f32 {
+    let a = f.saturating_mul(FRAME);
+    let Some(x) = audio.get(a..a.saturating_add(FRAME).min(audio.len())) else { return 0.0 };
+    let n = x.windows(2).filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0)).count();
+    n as f32 / x.len().max(1) as f32
+}
+
+/// The middle sample of 10 ms frame `f`.
+pub(crate) fn frame_centre(f: usize) -> usize {
+    f.saturating_mul(FRAME).saturating_add(FRAME / 2)
+}
+
+/// Fit each word's bounds to its voice (see the module docs): from its first voiced frame to its
+/// last, looked for up to 150 ms past its recognised bounds (and no further than the middle of the
+/// gap to a neighbour), widened by the soft sound joined to them. A word without a voiced frame (a
+/// whisper) keeps its bounds. Words in time order; they stay in order and apart.
+pub fn fit_words_to_voice(audio: &[f32], words: &mut [Word]) {
+    let db = frame_db(audio);
+    let n = db.len();
+    if n == 0 {
+        return;
+    }
+    let (th, edge) = (threshold(&db), edge_threshold(&db));
+    let ft = TICKS_PER_SAMPLE * FRAME as i64;
+    let floor = |t: filmcraft_time::Tick| usize::try_from(t.0.max(0) / ft).unwrap_or(usize::MAX).min(n);
+    let ceil = |t: filmcraft_time::Tick| usize::try_from(t.0.max(0).saturating_add(ft - 1) / ft).unwrap_or(usize::MAX).min(n);
+    let tick = |f: usize| filmcraft_time::Tick(i64::try_from(f).unwrap_or(i64::MAX).saturating_mul(ft));
+    let level = |f: usize| db.get(f).copied().unwrap_or(f32::NEG_INFINITY);
+    let voiced = |f: usize| level(f) >= th && periodicity(audio, frame_centre(f)) >= VOICED;
+    // the recognised bounds in frames, before any word moves
+    let bounds: Vec<(usize, usize)> = words.iter().map(|w| (floor(w.start), ceil(w.end).max(floor(w.start)))).collect();
+    // where the word before ends (fitted): no word starts before it
+    let mut prev_end = 0usize;
+    for (i, w) in words.iter_mut().enumerate() {
+        let Some(&(s, e)) = bounds.get(i) else { break };
+        // up to the middle of the gaps to the neighbours
+        let lo = i.checked_sub(1).and_then(|k| bounds.get(k)).map_or(0, |&(_, pe)| pe.max(s.saturating_sub(s.saturating_sub(pe) / 2)));
+        let hi = bounds.get(i + 1).map_or(n, |&(ns, _)| e.saturating_add(ns.saturating_sub(e) / 2)).min(n);
+        let lo = lo.min(s).max(prev_end);
+        let wa = s.saturating_sub(VOICE_SEARCH).max(lo);
+        let wb = e.saturating_add(VOICE_SEARCH).min(hi.max(e)).min(n);
+        let voice = (wa..wb).find(|&f| voiced(f)).and_then(|f0| Some((f0, (f0..wb).rev().find(|&f| voiced(f))?)));
+        let Some((f0, f1)) = voice else {
+            prev_end = prev_end.max(e.min(n));
+            continue;
+        };
+        let peak = (f0..=f1).map(level).fold(f32::NEG_INFINITY, f32::max);
+        // the soft sound joined to the voice: not far below it, or a hiss
+        let (soft, hiss) = (edge.max(peak - SOFT_DB), edge.max(peak - HISS_DB));
+        let joined = |f: usize| level(f) >= soft || (level(f) >= hiss && zero_crossings(audio, f) >= HISS_ZCR);
+        let mut a = f0;
+        while a > lo && f0 - a < SOFT_START && joined(a - 1) {
+            a -= 1;
+        }
+        let limit = hi.max(f1 + 1);
+        let mut b = f1 + 1;
+        while b < limit && b - (f1 + 1) < SOFT_END && joined(b) {
+            b += 1;
+        }
+        // a final stop released after its closure: a short burst soon after, then quiet
+        if let Some(r) = (b..b.saturating_add(CLOSURE_FRAMES).min(limit)).find(|&f| level(f) >= soft)
+            && let Some(r_end) = (r..limit).find(|&f| level(f) < soft)
+            && r_end - r <= RELEASE_FRAMES
+        {
+            b = r_end;
+        }
+        if b < a + MIN_WORD_FRAMES {
+            prev_end = prev_end.max(e.min(n));
+            continue;
+        }
+        w.start = tick(a);
+        w.end = tick(b);
+        prev_end = b;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +432,150 @@ mod tests {
         grow_speech(&[], &mut [true, false], -60.0);
         grow_speech(&[-10.0, -10.0], &mut [], -60.0);
         assert!(edge_threshold(&[]) < threshold(&[]));
+    }
+
+    const SR: usize = 16_000;
+
+    fn at(s: f64) -> usize {
+        (s * SR as f64).round() as usize
+    }
+
+    /// Noise of amplitude `amp` (pseudo-random, `seed`).
+    fn noise(len: usize, amp: f32, seed: u32) -> Vec<f32> {
+        let mut x = seed;
+        (0..len)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((x >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 2.0 * amp
+            })
+            .collect()
+    }
+
+    /// A hiss ("s"): noise with the low end taken out.
+    fn hiss(len: usize, amp: f32, seed: u32) -> Vec<f32> {
+        let n = noise(len + 1, amp, seed);
+        n.windows(2).map(|w| w[1] - w[0]).collect()
+    }
+
+    /// A voice at 140 Hz (ten harmonics), about −16 dBFS, with 5 ms fades.
+    fn voice(len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| {
+                let t = i as f32 / SR as f32;
+                let v: f32 = (1..=10).map(|k| (2.0 * std::f32::consts::PI * 140.0 * k as f32 * t).sin() / k as f32).sum();
+                let fade = (i.min(len - i) as f32 / 80.0).min(1.0);
+                0.18 * v * fade
+            })
+            .collect()
+    }
+
+    fn add(audio: &mut [f32], from: f64, part: &[f32]) {
+        for (a, p) in audio.iter_mut().skip(at(from)).zip(part) {
+            *a += p;
+        }
+    }
+
+    /// Room noise (about −65 dBFS) with the voice over `voiced` (seconds).
+    fn room_with_voice(secs: f64, voiced: &[(f64, f64)]) -> Vec<f32> {
+        let mut audio = noise(at(secs), 0.001, 1);
+        for &(a, b) in voiced {
+            add(&mut audio, a, &voice(at(b - a)));
+        }
+        audio
+    }
+
+    fn fit(audio: &[f32], bounds: &[(f64, f64)]) -> Vec<(f64, f64)> {
+        let mut w: Vec<Word> = bounds.iter().map(|&(a, b)| Word::new("w", seconds_tick(a), seconds_tick(b))).collect();
+        fit_words_to_voice(audio, &mut w);
+        w.iter().map(|w| (w.start.seconds(), w.end.seconds())).collect()
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() <= 0.011
+    }
+
+    /// The case of a deleted pause that left the breath: the recogniser started "Nee" in the inhale
+    /// before it (a gap, then the voice). Fitted, the word starts where the voice does.
+    #[test]
+    fn an_inhale_before_a_word_is_not_part_of_it() {
+        let mut audio = room_with_voice(2.0, &[(1.0, 1.6)]);
+        add(&mut audio, 0.5, &noise(at(0.4), 0.02, 7));
+        // tightening alone keeps the inhale in the word: it is louder than the speech threshold
+        let mut tight = vec![Word::new("Nee", seconds_tick(0.55), seconds_tick(1.6))];
+        tighten_words(&audio, &mut tight);
+        assert!(tight[0].start.seconds() < 0.6, "{:?}", tight[0]);
+        let w = fit(&audio, &[(0.55, 1.6)]);
+        assert!(close(w[0].0, 1.0) && close(w[0].1, 1.6), "{w:?}");
+        // an inhale joined to the voice without a gap: at most 150 ms of it stays
+        let mut audio = room_with_voice(2.0, &[(1.0, 1.6)]);
+        add(&mut audio, 0.6, &noise(at(0.4), 0.02, 7));
+        let w = fit(&audio, &[(0.6, 1.6)]);
+        assert!(close(w[0].0, 0.85), "{w:?}");
+    }
+
+    /// Breath let out after a word holds its end out for at most 120 ms.
+    #[test]
+    fn an_exhale_after_a_word_is_cut_short() {
+        let mut audio = room_with_voice(2.5, &[(1.0, 1.6)]);
+        add(&mut audio, 1.6, &noise(at(0.5), 0.02, 3));
+        let w = fit(&audio, &[(1.0, 2.1)]);
+        assert!(close(w[0].0, 1.0) && close(w[0].1, 1.72), "{w:?}");
+        // with a gap before it, none of it
+        let mut audio = room_with_voice(2.5, &[(1.0, 1.6)]);
+        add(&mut audio, 1.7, &noise(at(0.4), 0.02, 3));
+        let w = fit(&audio, &[(1.0, 2.1)]);
+        assert!(close(w[0].1, 1.6), "{w:?}");
+    }
+
+    /// The other way round: a word the recogniser started late (after its soft "s") or ended early
+    /// grows to its sound, so deleting the pause never cuts it.
+    #[test]
+    fn a_soft_start_placed_late_and_an_end_placed_early_are_found() {
+        let mut audio = room_with_voice(2.0, &[(1.0, 1.6)]);
+        add(&mut audio, 0.88, &hiss(at(0.12), 0.03, 5));
+        let w = fit(&audio, &[(1.06, 1.5)]);
+        assert!(close(w[0].0, 0.88) && close(w[0].1, 1.6), "{w:?}");
+        // a weak final "f" (40 dB below the vowel) the recogniser cut off: back in the word
+        let mut audio = room_with_voice(2.0, &[(1.0, 1.5)]);
+        add(&mut audio, 1.5, &hiss(at(0.11), 0.0017, 6));
+        let w = fit(&audio, &[(1.0, 1.45)]);
+        assert!(close(w[0].1, 1.61), "{w:?}");
+    }
+
+    /// The t of "ist" after its closure stays; so does a word without voice (a whisper), unmoved.
+    #[test]
+    fn a_final_stop_and_a_whisper_stay() {
+        let mut audio = room_with_voice(2.0, &[(1.0, 1.4)]);
+        add(&mut audio, 1.5, &noise(at(0.02), 0.3, 9));
+        let w = fit(&audio, &[(1.0, 1.8)]);
+        assert!(close(w[0].1, 1.52), "{w:?}");
+        let mut audio = room_with_voice(2.0, &[]);
+        add(&mut audio, 0.5, &hiss(at(0.5), 0.05, 2));
+        assert_eq!(fit(&audio, &[(0.4, 1.1)]), [(0.4, 1.1)]);
+    }
+
+    /// Two words: each keeps to its own voice, none reaches past the middle of the gap to the other,
+    /// and they stay in order. Hostile input does no harm.
+    #[test]
+    fn neighbours_keep_to_their_own_voice() {
+        let audio = room_with_voice(3.0, &[(0.5, 1.0), (1.3, 1.9)]);
+        // the recogniser ran the first word up to the second
+        let w = fit(&audio, &[(0.5, 1.3), (1.3, 1.9)]);
+        assert!(close(w[0].1, 1.0) && close(w[1].0, 1.3), "{w:?}");
+        // touching words over one stretch of voice stay as they are
+        let audio = room_with_voice(3.0, &[(0.5, 1.5)]);
+        let w = fit(&audio, &[(0.5, 1.0), (1.0, 1.5)]);
+        assert!(close(w[0].0, 0.5) && close(w[0].1, 1.0) && close(w[1].0, 1.0) && close(w[1].1, 1.5), "{w:?}");
+        let mut odd = vec![
+            Word::new("a", seconds_tick(2.5), seconds_tick(0.1)),
+            Word::new("b", filmcraft_time::Tick(-9), filmcraft_time::Tick(i64::MAX)),
+            Word::new("c", seconds_tick(9.0), seconds_tick(9.5)),
+        ];
+        fit_words_to_voice(&audio, &mut odd);
+        fit_words_to_voice(&[], &mut odd);
+        assert_eq!(periodicity(&[0.5; 10], 5), 0.0);
+        assert!(periodicity(&voice(4000), 2000) > 0.9);
+        assert!(periodicity(&noise(4000, 0.1, 4), 2000) < 0.3);
     }
 
     #[test]

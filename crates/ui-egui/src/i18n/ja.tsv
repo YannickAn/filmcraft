@@ -3522,9 +3522,9 @@
 	Keep before words	単語の前に残す
 	laugh	笑い
 	The laugh in it stays when the pause is deleted	ポーズを削除しても中の笑い声は残ります
-	Find laughs	笑い声を検出
-	Look for laughs in the pauses, so deleting a pause keeps them (the words stay)	ポーズ内の笑い声を検出し、ポーズを削除しても残します（単語はそのまま）
-	Find Laughs in Pauses	ポーズ内の笑い声を検出
+	Analyze audio	音声を解析
+	Fit the words to the voice and find the laughs in the pauses: a deleted pause is cut where the voice stops and starts, and a laugh stays (the words stay)	単語を声に合わせ、ポーズ内の笑い声を検出します。削除したポーズは声が止まる位置と始まる位置でカットされ、笑い声は残ります（単語はそのまま）
+	Analyze Audio for Pauses	ポーズ用に音声を解析
 	Minimum pause length	最小ポーズの長さ
 	More options	その他のオプション
 	Next result	次の結果

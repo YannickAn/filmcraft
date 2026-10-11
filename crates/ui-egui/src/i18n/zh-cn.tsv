@@ -3511,9 +3511,9 @@
 	Keep before words	词语前保留
 	laugh	笑声
 	The laugh in it stays when the pause is deleted	删除停顿时，其中的笑声会保留
-	Find laughs	查找笑声
-	Look for laughs in the pauses, so deleting a pause keeps them (the words stay)	查找停顿中的笑声，删除停顿时保留它们（词语不变）
-	Find Laughs in Pauses	查找停顿中的笑声
+	Analyze audio	分析音频
+	Fit the words to the voice and find the laughs in the pauses: a deleted pause is cut where the voice stops and starts, and a laugh stays (the words stay)	使词语贴合人声并查找停顿中的笑声：删除的停顿在人声停止和开始处剪切，笑声保留（词语不变）
+	Analyze Audio for Pauses	为停顿分析音频
 	Minimum pause length	最短停顿时长
 	More options	更多选项
 	Next result	下一个结果

@@ -733,12 +733,12 @@ impl Transcriber for Parakeet {
         let words = self.recognise(audio, &mut |f| progress(f * 0.95, &format!("Transcribing {:.0}%", f * 100.0)))?;
         let text: String = words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
         let language = language.unwrap_or_else(|| if self.multilingual() { guess_language(&text).unwrap_or("en").to_string() } else { "en".to_string() });
-        let mut t = Transcript { language, source: self.id.clone(), speakers: Vec::new(), words, laughs: None };
+        let mut t = Transcript { language, source: self.id.clone(), speakers: Vec::new(), words, laughs: None, audio_analysis: 0 };
         // a word ends at the next one's start at the latest
         t.normalize();
         crate::vad::tighten_words(audio, &mut t.words);
-        // a laugh in a pause stays when the pause is deleted
-        t.laughs = Some(crate::laugh::laughs(audio, &t.words));
+        // words fitted to their voice, laughs in the pauses found
+        crate::analyze_audio(audio, &mut t);
         if opts.diarize && !t.words.is_empty() {
             if !progress(0.96, "Labelling speakers") {
                 return Err(SpeechError::Cancelled);
