@@ -3,19 +3,22 @@
 //! loops, endless depth, huge folders) bounded.
 //!
 //! Fixtures (ffmpeg, `target/fixtures/engine/folder_import/`): a short H.264 movie and a WAV tone,
-//! copied into a nested temporary folder.
+//! copied into a nested temporary folder. Background imports (`background: true`: progress,
+//! Cancel, one edit when done) run on an in-memory card whose reads wait for the test.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use filmcraft_media::MediaKind;
 use filmcraft_project::{Bin, BinEntry};
 use serde_json::{Value, json};
 
-use crate::folder_import::{MAX_DEPTH, MAX_ENTRIES, MAX_FILES, MAX_FOLDERS, Walk, folder_name, walk};
+use crate::folder_import::{CANCELLED, MAX_DEPTH, MAX_ENTRIES, MAX_FILES, MAX_FOLDERS, Walk, folder_name, walk};
 use crate::media_browser::DirEntry;
 use crate::media_test_util::tmp_dir;
-use crate::{Services, Session};
+use crate::{Event, Services, Session};
 
 fn fixtures() -> Option<(PathBuf, PathBuf)> {
     let ffmpeg = filmcraft_testkit::oracle::ffmpeg_or_skip("folder import")?;
@@ -315,4 +318,196 @@ fn hostile_folders_through_file_import_leave_the_project_as_it_was() {
     let e = s.execute("file.import", json!({"paths": ["/top"], "imageSequence": true})).unwrap_err().to_string();
     assert!(!e.is_empty());
     assert!(s.project.root.children.is_empty());
+}
+
+/// A camera card in memory: `/card` holds `folders` folders `Clip <k>` of `files` WAV files each
+/// (and the `extra` files in its first folder). Reading a file waits while `gate` is closed (a
+/// slow card reader), and `panic.wav` takes the host down.
+struct Card {
+    folders: usize,
+    files: usize,
+    extra: Vec<&'static str>,
+    wav: Vec<u8>,
+    gate: Arc<AtomicBool>,
+}
+
+impl Card {
+    fn new(folders: usize, files: usize) -> Self {
+        let wav = filmcraft_media::wav::write_wav16(&[0.0; 480], 1, 48_000);
+        Card { folders, files, extra: Vec::new(), wav, gate: Arc::new(AtomicBool::new(true)) }
+    }
+}
+
+impl Services for Card {
+    fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        let t0 = Instant::now();
+        while !self.gate.load(Ordering::Relaxed) && t0.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!path.ends_with("panic.wav"), "the card reader fell over");
+        Ok(self.wav.clone())
+    }
+    fn write_file(&self, _: &str, _: &[u8]) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn file_size(&self, _: &str) -> std::io::Result<u64> {
+        Ok(self.wav.len() as u64)
+    }
+    fn is_dir(&self, path: &str) -> bool {
+        !path.rsplit('/').next().unwrap_or_default().contains('.')
+    }
+    fn list_entries(&self, dir: &str) -> Option<std::io::Result<Vec<DirEntry>>> {
+        if dir == "/card" {
+            return Some(Ok((0..self.folders).map(|k| DirEntry { name: format!("Clip {k:02}"), is_dir: true, ..Default::default() }).collect()));
+        }
+        let k = dir.rsplit(' ').next().unwrap_or_default();
+        let mut v: Vec<DirEntry> = (0..self.files).map(|i| DirEntry { name: format!("T{k}_{i:03}.wav"), ..Default::default() }).collect();
+        if k == "00" {
+            v.extend(self.extra.iter().map(|n| DirEntry { name: n.to_string(), ..Default::default() }));
+        }
+        Some(Ok(v))
+    }
+}
+
+/// The `jobs.list` entry of `job` (an agent's view of it).
+fn job_entry(s: &mut Session, job: u64) -> Value {
+    let jobs = s.execute("jobs.list", json!({})).unwrap();
+    jobs.as_array().unwrap().iter().find(|j| j["id"] == json!(job)).cloned().unwrap_or_else(|| panic!("no job {job}: {jobs}"))
+}
+
+/// Ask `jobs.list` (as an agent does, without a UI frame loop) until the job `job` is finished.
+fn wait_job(s: &mut Session, job: u64) -> Value {
+    let t0 = Instant::now();
+    loop {
+        let j = job_entry(s, job);
+        if j["finished"] == json!(true) {
+            return j;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(60), "job {job} did not finish: {j}");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn a_folder_imports_in_the_background_with_progress_as_one_undo_step() {
+    let card = Card::new(3, 40);
+    let gate = card.gate.clone();
+    gate.store(false, Ordering::Relaxed);
+    let mut s = Session::new(Arc::new(card));
+    let (undo, revision) = (s.history.undo.len(), s.revision);
+    let r = s.execute("file.import", json!({"paths": ["/card"], "background": true})).unwrap();
+    assert_eq!((&r["background"], &r["label"]), (&json!(true), &json!("Import card")), "{r}");
+    let job = r["job"].as_u64().unwrap();
+    // the files are being opened: nothing came in yet, and the job says so
+    let j = job_entry(&mut s, job);
+    assert_eq!((&j["label"], &j["finished"]), (&json!("Import card"), &json!(false)), "{j}");
+    assert!(j.get("import").is_none() && s.project.items.is_empty(), "{j}");
+    gate.store(true, Ordering::Relaxed);
+    let j = wait_job(&mut s, job);
+    assert_eq!((&j["done"], &j["total"], &j["progress"]), (&json!(120), &json!(120), &json!(1.0)), "{j}");
+    assert_eq!(j["result"]["frames"], json!(120), "{j}");
+    assert!(j["status"].as_str().unwrap().starts_with("Imported 120 files"), "{j}");
+    // what `file.import` returns, under `import`
+    let v = &j["import"];
+    assert_eq!((&v["job"], &v["errors"], &v["skippedCount"]), (&json!(job), &json!([]), &json!(0)), "{v}");
+    assert_eq!((v["items"].as_array().unwrap().len(), v["bins"].as_array().unwrap().len()), (120, 4), "{v}");
+    let b = bin_named(&s.project.root, "card").unwrap();
+    assert_eq!(tree(&s, b)["bins"].as_array().unwrap().len(), 3);
+    assert_eq!(tree(&s, bin_named(b, "Clip 01").unwrap())["items"].as_array().unwrap().len(), 40);
+    // one edit for all 120 files (not a copy of the project per file), one undo step
+    assert!(s.revision - revision <= 3, "{} edits", s.revision - revision);
+    assert_eq!(s.history.undo.len(), undo + 1);
+    assert_eq!(s.history.undo.last().unwrap().0, "Import card");
+    // the frontend hears of it, and the Events panel logs the job
+    let events = s.drain_events();
+    assert!(events.iter().any(|e| matches!(e, Event::Imported { job: j, result } if *j == job && result["items"] == v["items"])), "{events:?}");
+    let ev = s.execute("events.list", json!({})).unwrap();
+    assert!(ev["entries"].as_array().unwrap().iter().any(|e| e["message"] == json!("Finished: Import card")), "{ev}");
+    // undo takes the whole folder back
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(bin_named(&s.project.root, "card").is_none() && s.project.items.is_empty());
+}
+
+#[test]
+fn cancelling_a_background_import_brings_nothing_in() {
+    let card = Card::new(2, 30);
+    let gate = card.gate.clone();
+    gate.store(false, Ordering::Relaxed);
+    let mut s = Session::new(Arc::new(card));
+    let before = s.project.clone();
+    let job = s.execute("file.import", json!({"paths": ["/card"], "background": true})).unwrap()["job"].as_u64().unwrap();
+    s.execute("jobs.cancel", json!({"job": job})).unwrap();
+    gate.store(true, Ordering::Relaxed);
+    let j = wait_job(&mut s, job);
+    assert_eq!((&j["result"]["error"], &j["import"]["error"]), (&json!(CANCELLED), &json!(CANCELLED)), "{j}");
+    assert!(Arc::ptr_eq(&s.project, &before) && s.history.undo.is_empty());
+    assert!(s.drain_events().iter().any(|e| matches!(e, Event::Imported { job: j, result } if *j == job && result["error"] == json!(CANCELLED))));
+    let ev = s.execute("events.list", json!({"level": "warning"})).unwrap();
+    assert!(ev["entries"].as_array().unwrap().iter().any(|e| e["message"] == json!("Cancelled: Import card")), "{ev}");
+}
+
+#[test]
+fn a_background_import_stops_when_its_project_is_closed() {
+    let card = Card::new(2, 30);
+    let gate = card.gate.clone();
+    gate.store(false, Ordering::Relaxed);
+    let mut s = Session::new(Arc::new(card));
+    let job = s.execute("file.import", json!({"paths": ["/card"], "background": true})).unwrap()["job"].as_u64().unwrap();
+    // File ▸ New ▸ Project keeps the media pool: the project it was for is gone all the same
+    s.execute("file.newProject", json!({"name": "Other"})).unwrap();
+    gate.store(true, Ordering::Relaxed);
+    let j = wait_job(&mut s, job);
+    let e = j["import"]["error"].as_str().unwrap_or_default();
+    assert!(e.contains("project was closed"), "{j}");
+    assert!(s.project.name == "Other" && s.project.items.is_empty() && s.history.undo.is_empty());
+}
+
+#[test]
+fn a_file_that_takes_the_host_down_fails_on_its_own() {
+    let mut card = Card::new(1, 3);
+    card.extra = vec!["panic.wav", "notes.txt"];
+    let mut s = Session::new(Arc::new(card));
+    // `wait`: in the background, but returns what `file.import` returns when it is done
+    let r = s.execute("file.import", json!({"paths": ["/card"], "background": true, "wait": true})).unwrap();
+    assert!(r["job"].is_u64(), "{r}");
+    assert_eq!((r["items"].as_array().unwrap().len(), &r["skippedCount"]), (3, &json!(1)), "{r}");
+    let errors = r["errors"].as_array().unwrap();
+    assert!(errors.len() == 1 && errors[0].as_str().unwrap().contains("panic.wav: internal error"), "{r}");
+    // a flag that is not a boolean is no flag: imported now
+    let r = s.execute("file.import", json!({"paths": ["/card"], "background": "yes"})).unwrap();
+    assert!(r.get("job").is_none() && r["items"].as_array().unwrap().len() == 3, "{r}");
+    assert_eq!(s.history.undo.len(), 2);
+}
+
+/// How long a folder import holds up the session's thread, in one go and in the background (where
+/// it only brings the opened files in, one poll per UI frame). Media of your own:
+/// `FILMCRAFT_FOLDER_IMPORT_BENCH=<folder> cargo test -p filmcraft-engine --lib folder_import_bench -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn folder_import_bench() {
+    let Ok(dir) = std::env::var("FILMCRAFT_FOLDER_IMPORT_BENCH") else { return };
+    Session::default().execute("file.import", json!({"paths": [dir]})).unwrap(); // the file cache
+    let mut s = Session::default();
+    let t = Instant::now();
+    let r = s.execute("file.import", json!({"paths": [dir]})).unwrap();
+    let at_once = t.elapsed();
+    let mut s = Session::default();
+    let t = Instant::now();
+    let job = s.execute("file.import", json!({"paths": [dir], "background": true})).unwrap()["job"].as_u64().unwrap();
+    let started = t.elapsed();
+    let (mut longest, mut frames) = (Duration::ZERO, 0);
+    while s.imports.result(job).is_none() {
+        std::thread::sleep(Duration::from_millis(16));
+        let f = Instant::now();
+        s.poll_persistence();
+        longest = longest.max(f.elapsed());
+        frames += 1;
+    }
+    let v = s.imports.result(job).unwrap();
+    assert_eq!(v["items"].as_array().map(Vec::len), r["items"].as_array().map(Vec::len));
+    eprintln!(
+        "BENCH files={} file.import at once: {at_once:?} | background: start {started:?}, longest frame {longest:?} ({frames} frames), done after {:?}",
+        r["items"].as_array().unwrap().len(),
+        t.elapsed()
+    );
 }

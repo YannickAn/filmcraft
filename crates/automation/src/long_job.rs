@@ -2,7 +2,8 @@
 //! runs as a background engine job; the server reports its progress as MCP
 //! `notifications/progress` (when the request carried a `progressToken`) and stops it on
 //! `notifications/cancelled`, deleting the partial output. The session lock is only held for
-//! short polls, so other requests are answered while the export runs.
+//! short polls, so other requests are answered while the export runs. Folder imports
+//! (`file.import` / `file.importFolder` with `wait: true`) run the same way, as background imports.
 
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -14,8 +15,9 @@ use serde_json::{Value, json};
 
 use crate::server::FilmcraftMcp;
 
-/// Engine commands that block until a render is written when called with `wait: true`.
-pub const LONG_COMMANDS: &[&str] = &["file.exportMedia"];
+/// Engine commands that block until they are done when called with `wait: true`: a render is
+/// written, a folder's files are imported.
+pub const LONG_COMMANDS: &[&str] = &["file.exportMedia", "file.import", "file.importFolder"];
 
 /// How often the job is polled (and at most how often progress is reported).
 const POLL: Duration = Duration::from_millis(100);
@@ -23,6 +25,45 @@ const POLL: Duration = Duration::from_millis(100);
 /// Whether `command_run {id, params}` is a long call this module runs.
 pub fn is_long(id: &str, params: &Value) -> bool {
     LONG_COMMANDS.contains(&id) && params.get("wait").and_then(Value::as_bool) == Some(true)
+}
+
+/// An import: its job's outcome is `jobs.list`'s `import`, and plain files come in at once.
+fn is_import(id: &str) -> bool {
+    id == "file.import" || id == "file.importFolder"
+}
+
+/// The params that start the long command `id` as a job and return at once (`wait: false`;
+/// imports look through their folders in the background).
+pub fn start_params(id: &str, mut params: Value) -> Value {
+    if let Some(p) = params.as_object_mut() {
+        p.insert("wait".into(), json!(false));
+        if is_import(id) {
+            p.insert("background".into(), json!(true));
+        }
+    }
+    params
+}
+
+/// What the long command `id` started with `start` replies once its job is done (`entry`: the
+/// job's `jobs.list` entry, `None` when it is gone): for an export the start reply with the job's
+/// `result`, for an import what `file.import` returns; or why it failed.
+pub fn job_reply(id: &str, mut start: Value, entry: Option<&Value>) -> Result<Value, String> {
+    if is_import(id) {
+        let r = entry.and_then(|j| j.get("import")).cloned().unwrap_or(Value::Null);
+        return match r.get("error").and_then(Value::as_str) {
+            Some(e) => Err(format!("import failed: {e}")),
+            None if r.is_null() => Err("import failed: the import job is gone".into()),
+            None => Ok(r),
+        };
+    }
+    let result = entry.map(|j| j["result"].clone()).unwrap_or(Value::Null);
+    if let Some(e) = result.get("error").and_then(Value::as_str) {
+        return Err(format!("export failed: {e}"));
+    }
+    if let Some(o) = start.as_object_mut() {
+        o.insert("result".into(), result);
+    }
+    Ok(start)
 }
 
 /// Sends `notifications/progress` for one request; progress only ever increases.
@@ -50,16 +91,17 @@ impl Reporter {
 impl FilmcraftMcp {
     /// Run `id` (a [`LONG_COMMANDS`] entry, `wait: true`) as a job, reporting progress and
     /// honouring cancellation.
-    pub(crate) async fn run_long(&self, id: &str, mut params: Value, context: &RequestContext<RoleServer>) -> CallToolResult {
+    pub(crate) async fn run_long(&self, id: &str, params: Value, context: &RequestContext<RoleServer>) -> CallToolResult {
         let started = SystemTime::now();
-        if let Some(p) = params.as_object_mut() {
-            p.insert("wait".into(), json!(false));
-        }
-        let start = match self.run(id, params).await {
+        let start = match self.run(id, start_params(id, params)).await {
             Ok(v) => v,
             Err(e) => return CallToolResult::error(vec![Content::text(e.to_string())]),
         };
         let Some(job) = start.get("job").and_then(Value::as_u64) else {
+            // files without a folder are imported at once
+            if is_import(id) {
+                return CallToolResult::success(vec![Content::text(serde_json::to_string_pretty(&start).unwrap_or_default())]);
+            }
             return CallToolResult::error(vec![Content::text(format!("{id} started no job: {start}"))]);
         };
         let path = start.get("path").and_then(Value::as_str).unwrap_or_default().to_string();
@@ -72,22 +114,18 @@ impl FilmcraftMcp {
                 rep.report(done, total, j["status"].as_str().unwrap_or_default()).await;
             }
             if finished {
-                let result = state.map(|j| j["result"].clone()).unwrap_or(Value::Null);
-                if let Some(e) = result.get("error").and_then(Value::as_str) {
-                    return CallToolResult::error(vec![Content::text(format!("export failed: {e}"))]);
-                }
-                let mut out = start;
-                if let Some(o) = out.as_object_mut() {
-                    o.insert("result".into(), result);
-                }
-                return CallToolResult::success(vec![Content::text(serde_json::to_string_pretty(&out).unwrap_or_default())]);
+                return match job_reply(id, start, state.as_ref()) {
+                    Ok(out) => CallToolResult::success(vec![Content::text(serde_json::to_string_pretty(&out).unwrap_or_default())]),
+                    Err(e) => CallToolResult::error(vec![Content::text(e)]),
+                };
             }
             tokio::select! {
                 _ = context.ct.cancelled() => break,
                 _ = tokio::time::sleep(POLL) => {}
             }
         }
-        // Cancelled: stop the encode at the next batch, wait for the worker, delete the partial file.
+        // Cancelled: stop the encode at the next batch (an import brings nothing in), wait for the
+        // worker, delete the partial file.
         let _ = self.run("jobs.cancel", json!({"job": job})).await;
         for _ in 0..600 {
             if self.job_state(job).await.is_none_or(|j| j["finished"].as_bool() == Some(true)) {

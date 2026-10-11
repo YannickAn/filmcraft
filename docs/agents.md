@@ -172,6 +172,12 @@ progress and stop it:
 - Bridge mode works the same way: the export runs as an app job (the app stays responsive and shows
   "Exporting… NN%" in its status bar) and the call returns when it is written, however long it
   takes. `filmcraft-cli --bridge … exec file.exportMedia … wait=true` blocks the same way.
+- Folder imports too: `file.import` / `file.importFolder` with `wait: true` run as a background
+  import job (`background: true`, see [project-files.md](project-files.md#importing-folders)) with
+  the same progress notifications (files opened of all) and cancellation (nothing is imported), and
+  return what `file.import` returns. `media_import` and the CLI's `import` ask for it, so in bridge
+  mode a folder of thousands of clips neither freezes the app nor runs into the control server's
+  reply limit.
 
 ## 2. Control channel
 

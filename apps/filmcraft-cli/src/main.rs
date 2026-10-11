@@ -345,7 +345,8 @@ async fn cli() {
                 usage("import <file|folder>...");
             }
             let mut b = Backend::open(&a);
-            match b.exec("file.import", json!({"paths": paths})).await {
+            // `wait`: in bridge mode a folder is imported as an app job (the app stays responsive)
+            match b.exec("file.import", json!({"paths": paths, "wait": true})).await {
                 Ok(v) => print(&a, &v),
                 Err(e) => fail(format!("import: {e}")),
             }

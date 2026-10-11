@@ -121,6 +121,8 @@ pub type Actions = Vec<(String, Value)>;
 const HEADER_H: f32 = 26.0;
 const FOOTER_H: f32 = 32.0;
 const PREVIEW_H: f32 = 92.0;
+/// The row that shows a folder import running in the background.
+const IMPORT_H: f32 = 30.0;
 
 fn valid_bin(app: &FilmcraftApp, b: Option<u64>) -> Option<BinId> {
     b.map(BinId).filter(|b| app.session.project.root.find_bin(*b).is_some())
@@ -434,7 +436,9 @@ fn body(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, v: &View, actions
         preview_area(app, ui, pr, &pre);
         y = pr.max.y + 6.0;
     }
-    let content = Rect::from_min_max(pos2(rect.min.x + 4.0, y), pos2(rect.max.x - 4.0, rect.max.y - FOOTER_H));
+    let importing = import_job(app);
+    let bottom = rect.max.y - FOOTER_H - if importing.is_some() { IMPORT_H } else { 0.0 };
+    let content = Rect::from_min_max(pos2(rect.min.x + 4.0, y), pos2(rect.max.x - 4.0, bottom.max(y)));
     ui.painter().rect_filled(content, 4.0, t.panel_bg.gamma_multiply(0.92));
     let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(content).id_salt((&pre, "content")));
     cui.set_clip_rect(content.intersect(ui.clip_rect()));
@@ -443,7 +447,52 @@ fn body(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, v: &View, actions
         ViewMode::Icon => crate::panels::project_views::icon_view(app, &mut cui, content, v, &filter, actions),
         ViewMode::Freeform => crate::panels::project_views::freeform_view(app, &mut cui, content, v, &filter, actions),
     }
+    if let Some(job) = importing {
+        import_row(app, ui, Rect::from_min_max(pos2(rect.min.x + 4.0, content.max.y), pos2(rect.max.x - 4.0, rect.max.y - FOOTER_H)), &job, &pre, actions);
+    }
     footer(app, ui, Rect::from_min_max(pos2(rect.min.x, rect.max.y - FOOTER_H), rect.max), v, actions);
+}
+
+/// The folder import running in the background (the latest one), if any.
+fn import_job(app: &FilmcraftApp) -> Option<filmcraft_engine::Job> {
+    let running: Vec<u64> = app.session.imports.running().collect();
+    app.session.jobs.iter().rev().find(|j| running.contains(&j.id)).cloned()
+}
+
+/// A folder import in progress, under the items it is going into (Premiere shows an Import
+/// progress dialog; here the panel stays usable): how far it got, and Cancel.
+fn import_row(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, job: &filmcraft_engine::Job, pre: &str, actions: &mut Actions) {
+    use std::sync::atomic::Ordering;
+    let t = app.tokens;
+    let (done, total) = (job.progress.done.load(Ordering::Relaxed), job.progress.total.load(Ordering::Relaxed));
+    let name = job.label.strip_prefix("Import ").unwrap_or_default();
+    let text = match (total, name.is_empty()) {
+        (0, true) => tl!("Importing: looking through folders…").to_string(),
+        (0, false) => tlf!("Importing {name}: looking through folders…", name),
+        (_, true) => tlf!("Importing: {done} of {total} files", done, total),
+        (_, false) => tlf!("Importing {name}: {done} of {total} files", name, done, total),
+    };
+    let p = ui.painter();
+    p.rect_filled(r.shrink2(vec2(0.0, 2.0)), 4.0, t.row_alt);
+    let cancel = Rect::from_center_size(pos2(r.max.x - 14.0, r.center().y), vec2(18.0, 18.0));
+    let clip = Rect::from_min_max(pos2(r.min.x + 8.0, r.min.y), pos2(cancel.min.x - 6.0, r.center().y + 2.0));
+    p.with_clip_rect(clip).text(pos2(clip.min.x, r.min.y + 4.0), Align2::LEFT_TOP, &text, Tokens::ui(font(app) - 1.0), t.text_dim);
+    let bar = Rect::from_min_max(pos2(r.min.x + 8.0, r.max.y - 9.0), pos2(cancel.min.x - 6.0, r.max.y - 5.0));
+    p.rect_filled(bar, 2.0, t.field_bg);
+    let f = if total == 0 { 0.0 } else { job.progress.fraction().clamp(0.0, 1.0) };
+    p.rect_filled(Rect::from_min_max(bar.min, pos2(bar.min.x + bar.width() * f, bar.max.y)), 2.0, t.accent);
+    app.auto.add(&format!("{pre}.import.progress"), r, &text);
+    let resp = ui.interact(cancel, egui::Id::new((pre, "import-cancel", job.id)), Sense::click()).on_hover_text(tl!("Cancel"));
+    app.auto.add(&format!("{pre}.import.cancel"), cancel, &format!("Cancel {}", job.label));
+    let c = if resp.hovered() { t.danger } else { t.icon };
+    let k = 4.0;
+    let p = ui.painter();
+    p.line_segment([cancel.center() - vec2(k, k), cancel.center() + vec2(k, k)], Stroke::new(1.5, c));
+    p.line_segment([cancel.center() + vec2(-k, k), cancel.center() + vec2(k, -k)], Stroke::new(1.5, c));
+    if resp.clicked() {
+        actions.push(("jobs.cancel".into(), json!({"job": job.id})));
+    }
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
 }
 
 fn bin_path(root: &filmcraft_project::Bin, target: BinId) -> Vec<String> {

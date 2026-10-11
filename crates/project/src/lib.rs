@@ -1365,9 +1365,7 @@ impl Project {
 
     /// Add an item to a bin (root when None / not found).
     pub fn add_item(&mut self, name: &str, label: Label, kind: ItemKind, bin: Option<BinId>) -> ItemId {
-        let id = ItemId(self.alloc_id());
-        let created = id.0;
-        self.items.insert(id, ProjectItem { id, name: name.into(), label, kind, metadata: BTreeMap::new(), created, split: SplitMarks::default() });
+        let id = self.new_item(name, label, kind);
         if let Some(b) = bin.and_then(|b| self.root.find_bin_mut(b)) {
             b.children.push(BinEntry::Item(id));
         } else {
@@ -1376,14 +1374,27 @@ impl Project {
         id
     }
 
+    /// Add an item that is in no bin yet: the caller puts it in one (a bin tree built before it
+    /// is inserted with [`Project::insert_bin`], without a search of the tree for every item).
+    pub fn new_item(&mut self, name: &str, label: Label, kind: ItemKind) -> ItemId {
+        let id = ItemId(self.alloc_id());
+        let created = id.0;
+        self.items.insert(id, ProjectItem { id, name: name.into(), label, kind, metadata: BTreeMap::new(), created, split: SplitMarks::default() });
+        id
+    }
+
     pub fn add_bin(&mut self, name: &str, parent: Option<BinId>) -> BinId {
         let id = BinId(self.alloc_id());
-        let bin = Bin { id, name: name.into(), children: Vec::new() };
+        self.insert_bin(Bin { id, name: name.into(), children: Vec::new() }, parent);
+        id
+    }
+
+    /// Put a bin (with what is in it) into `parent` (root when None / not found).
+    pub fn insert_bin(&mut self, bin: Bin, parent: Option<BinId>) {
         match parent.and_then(|p| self.root.find_bin_mut(p)) {
             Some(p) => p.children.push(BinEntry::Bin(bin)),
             None => self.root.children.push(BinEntry::Bin(bin)),
         }
-        id
     }
 
     /// Move items into a bin (the root when `bin` is None). Returns how many moved; unknown items

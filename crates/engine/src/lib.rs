@@ -236,6 +236,9 @@ pub struct History {
     pub merge_key: Option<String>,
     /// The open [`Session::grouped`] run: its edits make no undo steps of their own.
     group: Option<UndoGroup>,
+    /// The project this history is of: every new or opened project starts a new history, and a
+    /// background job's result meant for the one before (a folder import) is dropped.
+    pub(crate) project: Arc<()>,
 }
 
 /// Edits of a [`Session::grouped`] run so far.
@@ -377,6 +380,12 @@ pub enum Event {
     OpenSource(ItemId),
     /// Show this item in the Project panel (Reveal in Project).
     RevealInProject(ItemId),
+    /// A background folder import (`file.import {background: true}`) is done: `result` is what
+    /// `file.import` returns, with `job`, or `{job, error}`.
+    Imported {
+        job: u64,
+        result: Value,
+    },
 }
 
 pub struct Session {
@@ -430,6 +439,8 @@ pub struct Session {
     pub scene_jobs: Vec<scene_detect::PendingScene>,
     /// Transcriptions running in the background (`transcript.generate`), applied when they finish.
     pub transcribe_jobs: Vec<transcript::PendingTranscription>,
+    /// Folder imports whose files are being opened in the background, and the last results.
+    pub imports: folder_import::Imports,
     /// Effect presets (built-in + the user's, persisted in the data directory).
     pub presets: presets::PresetLibrary,
     /// Export presets (built-in + the user's, persisted in the data directory) and favourites.
@@ -529,6 +540,7 @@ impl Session {
             mask_jobs: Vec::new(),
             scene_jobs: Vec::new(),
             transcribe_jobs: Vec::new(),
+            imports: Default::default(),
             presets: Default::default(),
             export_presets: Default::default(),
             export_queue: Default::default(),
@@ -623,6 +635,7 @@ impl Session {
         masks::poll(self);
         scene_detect::poll(self);
         transcript::poll(self);
+        folder_import::poll(self);
         export_tools::pump_queue(self, false);
         panels::log_jobs(self);
         let Some(p) = self.persistence.as_mut() else { return };
