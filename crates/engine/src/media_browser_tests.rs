@@ -305,7 +305,9 @@ fn import_as_image_sequence_applies_to_the_selected_stills() {
     assert_eq!(seq.as_media().unwrap().info.kind, MediaKind::ImageSequence);
     // a file that fails beside a sequence is reported, the sequence still comes in
     let mut s = session();
-    let r = s.execute("mediaBrowser.import", json!({"paths": [movies("shot_0001.png"), "/Volumes/Card/DCIM/Day 2/log.txt".to_string()], "imageSequence": true})).unwrap();
+    let r = s
+        .execute("mediaBrowser.import", json!({"paths": [movies("shot_0001.png"), "/Volumes/Card/DCIM/Day 2/log.txt".to_string()], "imageSequence": true}))
+        .unwrap();
     assert_eq!(r["items"].as_array().unwrap().len(), 1, "{r}");
     assert!(r["errors"].as_array().unwrap().iter().any(|e| e.as_str().unwrap().contains("log.txt")), "{r}");
     // off: the stills import one by one
