@@ -803,7 +803,7 @@ static CATEGORIES: &[Category] = &[
             f("audio.largeVolumeAdjustment", "Large Volume Adjustment", float(0.0, 96.0, 0, "dB"), true),
             b("audio.sumToMonoInSource", "Sum multichannel outputs to mono in Source Monitor", false),
             b("audio.scrubAudio", "Play audio while scrubbing in Source and Program Monitors", false),
-            b("audio.maintainPitchShuttling", "Maintain pitch while shuttling", false),
+            b("audio.maintainPitchShuttling", "Maintain pitch while shuttling", true),
             b("audio.muteInputDuringRecording", "Mute input during timeline recording", false),
             b("audio.generateWaveformsOnImport", "Generate waveforms automatically during import", false),
             b("audio.multithreadedWaveforms", "Generate waveforms and conform audio using multithreading", false),

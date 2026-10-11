@@ -53,6 +53,26 @@ available through the UI command registry, CLI bridge and MCP. `playback.toggle`
 `monitor: "source"|"program"` to override focus. `ui.inspect.sourcePlayback` reports playing,
 audioClock and playhead. Test: `cargo test --release -p filmcraft-ui-egui --test source_playback_ui`.
 
+## Program playback speed and sound
+
+L, J and K shuttle the Program monitor as in Premiere: each further L (J) doubles the speed
+forwards (backwards) up to 8×, Shuttle Slow Right / Left (`playback.slowForward` / `slowReverse`,
+Shift+L / Shift+J in the Premiere preset) play at ±0.25×, and `ui.playback {action: "play", speed}` plays at any speed. The sound follows the speed.
+With Settings ▸ Audio ▸ **Maintain pitch while shuttling** (on by default) it keeps its pitch: a
+voice at 2× sounds like the same voice talking faster, never higher. The timeline's mix is
+time-stretched by WSOLA (`filmcraft_audio_dsp::stretch`). With the setting off it is varispeed like
+tape: 2× is an octave up. Backwards, the sound plays backwards (at its own pitch with the setting
+on). Faster than 16× or slower than 1/16× either way (only possible through `ui.playback`) plays
+silent.
+
+The playhead keeps following the audio device's clock (frames played × speed), so picture and sound
+stay together at every speed. On desktop the stretched sound is mixed ahead like 1× playback, and
+`perf.stats` → `playback.audio` reports its `underruns` and `missingFrames`. A speed change restarts
+the sound at the playhead. Code: `crates/ui-egui/src/shuttle.rs`. Test:
+`cargo test -p filmcraft-ui-egui --lib shuttle` (pitch kept and duration halved at 2×, octave up
+without the setting, reverse order and pitch, an underrun's cursor jump, the demo project's music at
+2×, 4×, −2×, ±0.25×).
+
 ## Drag a marked Source range to the timeline
 
 An unmarked Source clip shows In at its beginning and Out on its last frame. These are implicit
