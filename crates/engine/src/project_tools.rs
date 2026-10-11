@@ -101,7 +101,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             r#"{"paths":[str]?,"imageSequence":bool?}"#,
             always,
             |s, p| {
-                // the Media Browser's selection unless `paths` are given
+                // the Media Browser's selection unless `paths` are given, imported as its Import does
                 let paths = match p.get("paths").and_then(Value::as_array) {
                     Some(a) => a.clone(),
                     None => s.browser.selection.iter().map(|x| json!(x)).collect(),
@@ -109,8 +109,11 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
                 if paths.is_empty() {
                     return Err(bad("file.importFromMediaBrowser", "select files in the Media Browser"));
                 }
-                let seq = p.get("imageSequence").and_then(Value::as_bool).unwrap_or(false);
-                s.execute("file.import", json!({"paths": paths, "imageSequence": seq}))
+                let mut q = json!({"paths": paths});
+                if let Some(seq) = p.get("imageSequence").and_then(Value::as_bool) {
+                    q["imageSequence"] = json!(seq);
+                }
+                s.execute("mediaBrowser.import", q)
             },
         ),
         // File ▸ Import with "Image Sequence" checked (the UI asks for the first frame).

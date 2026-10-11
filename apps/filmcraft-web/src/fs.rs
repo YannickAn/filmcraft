@@ -400,6 +400,13 @@ impl Services for WebServices {
         Some(Ok(out))
     }
 
+    /// A folder of the virtual file table is any path with files below it (as `list_entries`
+    /// shows them), so importing one from the Media Browser makes its bins.
+    fn is_dir(&self, path: &str) -> bool {
+        let prefix = if path.ends_with('/') { path.to_string() } else { format!("{path}/") };
+        FS.with(|fs| fs.borrow().entries.keys().any(|p| p.len() > prefix.len() && p.starts_with(&prefix)))
+    }
+
     fn home_dir(&self) -> Option<String> {
         Some("/files".into())
     }

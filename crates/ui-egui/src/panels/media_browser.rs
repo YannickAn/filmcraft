@@ -1,7 +1,8 @@
 //! Media Browser panel (M12.7): a directory tree (Favorites, Local Drives, Network, Recent
 //! Directories) beside the media list (List or Thumbnails view with hover scrub), back / forward /
 //! up navigation, the path field, the file-type filter, Ingest and Import as Image Sequence, Edit
-//! Columns…, Import / Open In Source Monitor and dragging files to the Project panel or Timeline.
+//! Columns…, Import / Open In Source Monitor and dragging files to the Project panel or Timeline
+//! (folders to the Project panel, where they become bins).
 //!
 //! Listing, navigation, Favorites, settings and import are engine commands
 //! (`filmcraft_engine::media_browser`, `mediaBrowser.*`); this module draws them and keeps only view
@@ -44,9 +45,9 @@ struct Cache {
     /// Preview items for thumbnails of files not in the project: path → id.
     preview_ids: BTreeMap<String, u64>,
     preview: Arc<Project>,
-    /// Item imported for a drag in progress (undone when it is dropped nowhere): items, history
-    /// length after the import, last pointer position.
-    drag: Option<(Vec<u64>, usize, egui::Pos2)>,
+    /// Items imported for a drag in progress (undone when it is dropped nowhere): items, history
+    /// length before and after the import, last pointer position.
+    drag: Option<(Vec<u64>, usize, usize, egui::Pos2)>,
 }
 
 const PREVIEW_BASE: u64 = 1 << 44;
@@ -394,7 +395,7 @@ fn entry_interactions(app: &mut FilmcraftApp, ui: &egui::Ui, resp: &egui::Respon
             exec(app, &ctx, "mediaBrowser.openInSource", json!({"path": e.path}));
         }
     }
-    if resp.drag_started() && !e.is_dir {
+    if resp.drag_started() {
         start_file_drag(app, ui, e);
     }
     resp.context_menu(|ui| {
@@ -436,9 +437,14 @@ fn entry_interactions(app: &mut FilmcraftApp, ui: &egui::Ui, resp: &egui::Respon
 }
 
 /// Dragging a file imports it (the selection when the file is in it) and carries the new item, so
-/// the Project panel, Timeline and monitors accept it; a drop elsewhere undoes the import.
+/// the Project panel, Timeline and monitors accept it; a drop elsewhere undoes the import. A
+/// selection with folders is imported only when dropped on the Project panel ([`drop_folders`]).
 fn start_file_drag(app: &mut FilmcraftApp, ui: &egui::Ui, e: &Entry) {
     let paths: Vec<String> = if app.session.browser.selection.contains(&e.path) { app.session.browser.selection.clone() } else { vec![e.path.clone()] };
+    if e.is_dir || paths.iter().any(|p| app.session.services.is_dir(p)) {
+        crate::panels::start_drag_paths(ui, paths);
+        return;
+    }
     // files already in the project are dragged as they are
     if let Some(i) = mb::item_for_path(&app.session, &e.path) {
         crate::panels::start_drag_item(ui, i);
@@ -451,32 +457,75 @@ fn start_file_drag(app: &mut FilmcraftApp, ui: &egui::Ui, e: &Entry) {
         crate::panels::start_drag_item(ui, ItemId(*first));
         let pos = ui.ctx().pointer_latest_pos().unwrap_or_default();
         let after = app.session.history.undo.len();
-        with_cache(ui.ctx(), |c| c.drag = Some((items, after.max(before), pos)));
+        with_cache(ui.ctx(), |c| c.drag = Some((items, before.min(after), after.max(before), pos)));
     }
 }
 
 /// After a file drag ends: keep the import when it landed on a panel that takes items.
 fn finish_drag(app: &mut FilmcraftApp, ui: &egui::Ui) {
-    let Some((items, hist, _)) = with_cache(ui.ctx(), |c| c.drag.clone()) else { return };
+    drop_folders(app, ui);
+    let Some((items, before, hist, _)) = with_cache(ui.ctx(), |c| c.drag.clone()) else { return };
     if crate::panels::dragged_project_item(ui).is_some() {
         if let Some(p) = ui.ctx().pointer_latest_pos() {
             with_cache(ui.ctx(), |c| {
                 if let Some(d) = c.drag.as_mut() {
-                    d.2 = p;
+                    d.3 = p;
                 }
             });
         }
         return;
     }
-    let pos = with_cache(ui.ctx(), |c| c.drag.take().map(|d| d.2)).unwrap_or_default();
+    let pos = with_cache(ui.ctx(), |c| c.drag.take().map(|d| d.3)).unwrap_or_default();
     let targets = ["panel.Project", "panel.Timeline", "panel.Source", "panel.Program"];
-    let landed =
-        targets.iter().any(|t| app.auto.find(t).is_some_and(|e| Rect::from_min_size(pos2(e.rect[0], e.rect[1]), vec2(e.rect[2], e.rect[3])).contains(pos)));
+    let landed = targets.iter().any(|t| app.auto.find(t).is_some_and(|e| element_rect(e).contains(pos)));
     let used_elsewhere = app.session.history.undo.len() > hist;
     if !landed && !used_elsewhere && items.iter().all(|i| app.session.project.item(ItemId(*i)).is_some()) {
-        // dropped nowhere: take the import back
-        let _ = app.session.execute("edit.undo", json!({}));
+        // dropped nowhere: take the import back, one undo step per file, until its items are gone
+        // (the history may be at its limit, so its length alone doesn't tell the steps)
+        for _ in 0..hist.saturating_sub(before).max(items.len()) {
+            if !items.iter().any(|i| app.session.project.item(ItemId(*i)).is_some()) || app.session.execute("edit.undo", json!({})).is_err() {
+                break;
+            }
+        }
     }
+}
+
+fn element_rect(e: &crate::automation::Element) -> Rect {
+    Rect::from_min_size(pos2(e.rect[0], e.rect[1]), vec2(e.rect[2], e.rect[3]))
+}
+
+/// Folders dragged from the browser: released over the Project panel, they import as when dropped
+/// from the file manager, into the bin under the pointer (its row or icon) or else the bin the
+/// panel shows, which is outlined while dragging. Released anywhere else, nothing happens.
+fn drop_folders(app: &mut FilmcraftApp, ui: &egui::Ui) {
+    let Some(paths) = crate::panels::dragged_paths(ui) else { return };
+    let Some(pos) = ui.ctx().pointer_latest_pos() else { return };
+    let target = folder_drop_target(app, pos);
+    if let Some((_, r)) = target {
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("mb-folder-drop")));
+        painter.rect_stroke(r, 3.0, Stroke::new(1.5, app.tokens.accent), StrokeKind::Inside);
+    }
+    if !ui.input(|i| i.pointer.any_released()) {
+        return;
+    }
+    crate::panels::clear_drag(ui);
+    let Some((bin, _)) = target else { return };
+    let r = app.session.execute("mediaBrowser.import", json!({"paths": paths, "bin": bin})).map_err(|e| e.to_string());
+    app.report_import(&r);
+}
+
+/// The bin folders dropped at `pos` go into, and the rect to outline: a Project panel bin under
+/// the pointer, else the bin the panel shows. None outside the Project panel.
+fn folder_drop_target(app: &FilmcraftApp, pos: egui::Pos2) -> Option<(u64, Rect)> {
+    let panel = app.auto.find("panel.Project").map(element_rect).filter(|r| r.contains(pos))?;
+    let on_bin = app.auto.query("").into_iter().find_map(|e| {
+        let (view, bin) = e.id.rsplit_once(".bin.")?;
+        let bin = bin.parse::<u64>().ok()?;
+        let r = element_rect(e);
+        let ours = view == "project" || view.starts_with("projectBin.");
+        (ours && r.contains(pos) && app.session.project.root.find_bin(filmcraft_project::BinId(bin)).is_some()).then_some((bin, r))
+    });
+    on_bin.or(Some((app.import_bin().0, panel)))
 }
 
 fn list(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, entries: &[Entry], columns: &[String]) {

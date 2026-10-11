@@ -1212,7 +1212,7 @@ impl FilmcraftApp {
 
     /// Say in the status bar how an import went: what failed, or for folders what came in and
     /// what was left out (the Events panel lists each).
-    fn report_import(&mut self, r: &Result<Value, String>) {
+    pub(crate) fn report_import(&mut self, r: &Result<Value, String>) {
         let v = match r {
             Ok(v) => v,
             Err(e) => {

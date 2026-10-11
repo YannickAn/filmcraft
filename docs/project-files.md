@@ -245,10 +245,19 @@ the items of an open dropdown; `settings.<key>.browse`, `settings.<key>.hex`;
 ## Importing folders
 
 Dropping a folder from Explorer or Finder on the window, **File ▸ Import Folder…**
-(`file.importFolder {path, bin?}`) and `file.import` with a folder among its `paths` (the CLI's
-`import`, MCP `media_import`) import a folder as Premiere does: the folder becomes a bin of its name
-(inside `bin`, or the bin the Project panel shows), each sub-folder a bin inside it, and every
-video, audio and still file goes into the bin of its folder. Folders without media make no bin.
+(`file.importFolder {path, bin?}`), `file.import` with a folder among its `paths` (the CLI's
+`import`, MCP `media_import`) and the **Media Browser** import a folder as Premiere does: the folder
+becomes a bin of its name (inside `bin`, or the bin the Project panel shows), each sub-folder a bin
+inside it, and every video, audio and still file goes into the bin of its folder. Folders without
+media make no bin.
+
+- **Media Browser:** Import (panel menu, a folder's or the tree's context menu,
+  `mediaBrowser.import {paths?, bin?, imageSequence?}`) and **File ▸ Import from Media Browser**
+  import the selected folders this way, beside the selected files. Dragging a folder (or a
+  selection with folders) to the Project panel imports it on release, into the bin under the
+  pointer or else the bin the panel shows; dropped anywhere else, nothing is imported. With
+  **Import as Image Sequence** on, each image sequence among the selected numbered stills imports
+  once, from its lowest selected frame; it does not apply inside folders (the setting below does).
 
 - **Skipped, not errors:** files that are not media (documents, unsupported formats) and captions,
   projects and interchange files (they add sequences and caption tracks: import them on their own)

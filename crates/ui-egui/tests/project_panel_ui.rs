@@ -17,6 +17,7 @@ use filmcraft_engine::project_panel::{FREEFORM_POS, FREEFORM_STACK, ViewMode};
 use filmcraft_project::{BinEntry, ItemId};
 use filmcraft_ui_egui::FilmcraftApp;
 use filmcraft_ui_egui::control::ControlRequest;
+use filmcraft_ui_egui::dock::PanelKind;
 use serde_json::{Value, json};
 
 struct Driver {
@@ -652,23 +653,59 @@ fn media_browser_drag_imports_into_the_project_panel() {
     let mut session = Session::default();
     session.execute("file.openDemoProject", json!({})).unwrap();
     let mut d = Driver::with(session);
-    // the Editing workspace has Project and Media Browser in one group: put the browser beside it
+    // the Editing workspace has Project and Media Browser in one group: move the browser to the
+    // Source monitor's group so both are on show
     d.ok("ui.set", json!({"workspace": "Editing"}));
+    d.app().ui.dock.close(PanelKind::MediaBrowser);
+    d.app().ui.dock.open_near(PanelKind::MediaBrowser, PanelKind::Source);
     d.ok("ui.panel.show", json!({"panel": "MediaBrowser"}));
+    d.ok("ui.panel.show", json!({"panel": "Project"}));
     d.exec("mediaBrowser.navigate", json!({"path": dir.to_string_lossy()}));
     d.frames(3);
     d.wait_for("mediaBrowser.entry.b-roll.wav");
     let n0 = d.app().session.project.items.len();
-    // dropped on the Media Browser itself: the import is taken back
+    // two files dropped on the Media Browser itself: both imports are taken back (only the last
+    // one used to be)
+    d.click("mediaBrowser.entry.a-interview.wav");
+    d.ok("ui.click", json!({"id": "mediaBrowser.entry.b-roll.wav", "command": true}));
+    d.frames(2);
+    assert_eq!(d.app().session.browser.selection.len(), 2);
     let e = d.rect("mediaBrowser.entry.b-roll.wav");
     let from = (e[0] + 40.0, e[1] + e[3] / 2.0);
     d.ok("ui.drag", json!({"from": {"x": from.0, "y": from.1}, "to": {"x": from.0 + 30.0, "y": from.1 + 60.0}}));
     d.frames(6);
     assert_eq!(d.app().session.project.items.len(), n0, "dropped nowhere");
     // dropped on the Timeline: imported and placed
+    d.click("mediaBrowser.entry.b-roll.wav");
     let tl = d.rect("panel.Timeline");
     d.ok("ui.drag", json!({"from": {"x": from.0, "y": from.1}, "to": {"x": tl[0] + tl[2] * 0.6, "y": tl[1] + tl[3] * 0.75}, "steps": 20}));
     d.frames(6);
     assert_eq!(d.app().session.project.items.len(), n0 + 1, "kept after a drop on the Timeline");
+    // a folder dropped on the Timeline imports nothing
+    let f = d.rect("mediaBrowser.entry.Selects");
+    let from = (f[0] + 40.0, f[1] + f[3] / 2.0);
+    d.ok("ui.drag", json!({"from": {"x": from.0, "y": from.1}, "to": {"x": tl[0] + tl[2] * 0.6, "y": tl[1] + tl[3] * 0.75}, "steps": 20}));
+    d.frames(6);
+    assert_eq!(d.app().session.project.items.len(), n0 + 1, "a folder on the Timeline");
+    // a folder dropped on a bin of the Project panel becomes a bin inside it, with its media, as
+    // when dropped from the file manager (it used to be undraggable)
+    let cards = d.exec("file.newBin", json!({"name": "Cards"}))["bin"].as_u64().unwrap();
+    let target = format!("project.bin.{cards}");
+    d.wait_for(&target);
+    let b = d.rect(&target);
+    d.ok("ui.drag", json!({"from": {"x": from.0, "y": from.1}, "to": {"x": b[0] + b[2] / 2.0, "y": b[1] + b[3] / 2.0}, "steps": 20}));
+    d.frames(6);
+    let p = d.app().session.project.clone();
+    let in_cards = p.root.find_bin(filmcraft_project::BinId(cards)).unwrap();
+    let selects = in_cards
+        .children
+        .iter()
+        .find_map(|e| if let BinEntry::Bin(b) = e { (b.name == "Selects").then(|| b.clone()) } else { None })
+        .unwrap_or_else(|| panic!("no Selects bin in Cards: {:?}", in_cards.children));
+    let names: Vec<String> =
+        selects.children.iter().filter_map(|e| if let BinEntry::Item(i) = e { Some(p.item(*i).unwrap().name.clone()) } else { None }).collect();
+    assert_eq!(names, ["pick.wav"]);
+    assert_eq!(d.app().ui.status, "Folder import: 1 imported");
+    assert_eq!(d.app().session.project.items.len(), n0 + 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
