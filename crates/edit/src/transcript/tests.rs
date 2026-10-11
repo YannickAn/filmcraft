@@ -369,3 +369,86 @@ fn captions_never_overlap_with_dense_words() {
     let b = caption_blocks(&words, &rules, R);
     check_blocks(&b, &rules);
 }
+
+/// The interview with its audio measured: "show." is transcribed until 1.70 s but its sound stops
+/// at 1.50; a laugh from 2.40 to 2.90; silence again until 3.65, just before "Um," (3.70). The
+/// shorter gaps later on hold sound (breaths, noise): no silence there.
+fn heard() -> Transcripts {
+    let mut t = fixture();
+    t.silences = Some(vec![TimeRange::from_bounds(s(0.0), s(0.45)), TimeRange::from_bounds(s(1.50), s(2.40)), TimeRange::from_bounds(s(2.90), s(3.65))]);
+    t.normalize();
+    let mut m = Transcripts::new();
+    m.insert(MEDIA, Arc::new(t));
+    m
+}
+
+/// A pause is silence: it starts where the sound of the word before it stops (before the word's
+/// transcribed end), a laugh between the words is not part of it, and gaps that hold sound are
+/// no pauses. Deleting it removes each silent stretch less what is kept next to the sound, so the
+/// laugh stays whole.
+#[test]
+fn pauses_follow_the_audio_where_it_was_measured() {
+    let q = whole();
+    let (w, h) = (sequence_words(&q, &heard()), sequence_hearing(&q, &heard()));
+    assert_eq!(h.known, vec![TimeRange::from_bounds(s(0.0), s(10.0))]);
+    let p = pauses_heard(&w, &h, s(0.5));
+    assert_eq!(p, vec![Pause { after: 3, start: s(1.50), end: s(3.65) }], "from where the sound stops to where it starts again");
+    let spans = pause_spans(&w, &h, &p[0], s(0.5));
+    assert_eq!(spans, vec![TimeRange::from_bounds(s(1.50), s(2.40)), TimeRange::from_bounds(s(2.90), s(3.65))], "the laugh is not part of it");
+    // deleting it: 0.1 s kept next to the word and next to the laugh, frames inward (25 fps)
+    let cut = pause_ranges(&spans, s(0.1), R);
+    assert_eq!(cut, vec![TimeRange::from_bounds(s(1.60), s(2.28)), TimeRange::from_bounds(s(3.00), s(3.52))]);
+    assert!(cut.iter().all(|r| r.end() <= s(2.40) - s(0.1) || r.start >= s(2.90) + s(0.1)), "the laugh and 0.1 s around it stay");
+    assert_eq!(find_pauses_heard(&w, &h, s(0.5), s(0.1), R), cut);
+    // a longer minimum: only the silence before the laugh is long enough
+    assert_eq!(pauses_heard(&w, &h, s(0.8)), vec![Pause { after: 3, start: s(1.50), end: s(2.40) }]);
+    // the later gaps (0.5 s, 0.4 s) hold sound: no pauses, however short the minimum
+    assert_eq!(pauses_heard(&w, &h, s(0.1)).len(), 1);
+    // the silence before the first word is no pause (there is no word before it)
+    assert!(pauses_heard(&w, &h, s(0.1)).iter().all(|p| p.after == 3));
+    // without the measurement: the time between the words, as before
+    let none = Hearing::default();
+    assert_eq!(pauses_heard(&w, &none, s(0.4)), pauses(&w, s(0.4)));
+    assert_eq!(find_pauses_heard(&w, &none, s(1.0), s(0.1), R), find_pauses(&w, s(1.0), s(0.1), R));
+    assert_eq!(pause_after_heard(&w, &none, 3, Tick(1)), pause_after(&w, 3));
+}
+
+/// A pause reaches at most 0.5 s into the word before it (and no further than its start): a word
+/// transcribed far too late does not become one long pause.
+#[test]
+fn a_pause_reaches_at_most_half_a_second_into_a_word() {
+    let mut t = fixture();
+    // silence from 1.0: inside "the" (0.9–1.2) and "show." (1.2–1.7), on to 3.65
+    t.silences = Some(vec![TimeRange::from_bounds(s(1.0), s(3.65))]);
+    let mut m = Transcripts::new();
+    m.insert(MEDIA, Arc::new(t));
+    let q = whole();
+    let (w, h) = (sequence_words(&q, &m), sequence_hearing(&q, &m));
+    let p = pause_after_heard(&w, &h, 3, s(0.1)).unwrap();
+    assert_eq!((p.start, p.end), (s(1.20), s(3.65)), "no further back than the start of \"show.\"");
+}
+
+/// Silences are mapped through the clips like the words; a clip on a higher track whose
+/// transcript holds no silences is heard there, so nothing below it is measured.
+#[test]
+fn silences_map_through_clips_and_tracks() {
+    let mut q = seq();
+    // media 1.0 s on at timeline 2.0 s
+    q.audio_tracks[0].items.push(clip(100, 2.0, 5.0, 1.0));
+    let h = sequence_hearing(&q, &heard());
+    assert_eq!(h.known, vec![TimeRange::from_bounds(s(2.0), s(7.0))]);
+    assert_eq!(h.silent, vec![TimeRange::from_bounds(s(2.50), s(3.40)), TimeRange::from_bounds(s(3.90), s(4.65))]);
+    // A1 over A2: an untranscribed-silence clip on A1 from 3.0 to 4.0 hides A2's silence there
+    let mut q2 = seq();
+    q2.audio_tracks[1].items.push(clip(200, 0.0, 10.0, 0.0));
+    let mut top = clip(201, 3.0, 1.0, 0.0);
+    top.item = ItemId(2);
+    q2.audio_tracks[0].items.push(top);
+    let mut tr = heard();
+    tr.insert(ItemId(2), Arc::new(fixture()));
+    let h2 = sequence_hearing(&q2, &tr);
+    assert_eq!(h2.known, vec![TimeRange::from_bounds(s(0.0), s(3.0)), TimeRange::from_bounds(s(4.0), s(10.0))]);
+    assert!(h2.silent.iter().all(|r| r.end() <= s(3.0) || r.start >= s(4.0)), "{:?}", h2.silent);
+    // nothing transcribed: nothing measured
+    assert_eq!(sequence_hearing(&q2, &Transcripts::new()), Hearing::default());
+}

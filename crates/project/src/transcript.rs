@@ -73,6 +73,12 @@ pub struct Transcript {
     pub speakers: Vec<Speaker>,
     /// Words in time order, non-overlapping.
     pub words: Vec<Word>,
+    /// Where the audio is silent (media time, sorted, non-overlapping): no speech, and no other
+    /// sound either (a laugh, a breath next to a word). Measured from the audio that was
+    /// transcribed; None for transcripts made before that, imported or typed ones. A pause is
+    /// silence between words, so one that holds a laugh keeps the laugh.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub silences: Option<Vec<TimeRange>>,
 }
 
 impl Transcript {
@@ -113,6 +119,19 @@ impl Transcript {
             if self.words[i - 1].end > s {
                 self.words[i - 1].end = s.max(self.words[i - 1].start);
             }
+        }
+        // silences: sorted, empty ones dropped, overlaps merged
+        if let Some(sil) = self.silences.as_mut() {
+            sil.retain(|r| r.duration > Tick::ZERO);
+            sil.sort_by_key(|r| r.start);
+            let mut merged: Vec<TimeRange> = Vec::with_capacity(sil.len());
+            for r in sil.drain(..) {
+                match merged.last_mut() {
+                    Some(last) if r.start <= last.end() => *last = TimeRange::from_bounds(last.start, last.end().max(r.end())),
+                    _ => merged.push(r),
+                }
+            }
+            *sil = merged;
         }
         let max = self.words.iter().filter_map(|w| w.speaker).max();
         if let Some(m) = max {
@@ -161,6 +180,18 @@ mod tests {
         assert_eq!(t.speakers.len(), 2);
         assert_eq!(t.speaker_name(&t.words[1]).as_deref(), Some("Speaker 2"));
         t.check().unwrap();
+    }
+
+    #[test]
+    fn normalize_merges_silences_and_old_transcripts_have_none() {
+        let r = |a: i64, b: i64| TimeRange::from_bounds(Tick(a), Tick(b));
+        let mut t = Transcript { silences: Some(vec![r(50, 60), r(0, 10), r(5, 20), r(30, 30)]), ..Default::default() };
+        t.normalize();
+        assert_eq!(t.silences, Some(vec![r(0, 20), r(50, 60)]));
+        // a transcript saved before silences were measured reads as unknown, and stays unwritten
+        let old: Transcript = serde_json::from_str(r#"{"language":"en","source":"x","speakers":[],"words":[]}"#).unwrap();
+        assert_eq!(old.silences, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("silences"));
     }
 
     #[test]

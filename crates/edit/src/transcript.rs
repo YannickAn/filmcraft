@@ -185,15 +185,145 @@ pub fn media_word_range(t: &Transcript, a: usize, b: usize, rate: FrameRate) -> 
     Some(TimeRange::from_bounds(s, e2))
 }
 
+/// What the audio of the transcribed clips says about the sequence: where it is silent (no
+/// speech, and no other sound either: a laugh, a cough), and where that was measured (the
+/// timeline spans of clips whose transcript holds [`Transcript::silences`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Hearing {
+    /// Silent ranges, sequence time, sorted and merged.
+    pub silent: Vec<TimeRange>,
+    /// Ranges where the audio was measured, sorted and merged.
+    pub known: Vec<TimeRange>,
+}
+
+/// `r` less the parts `cut` covers (both sorted).
+fn subtract(r: TimeRange, cut: &[TimeRange]) -> Vec<TimeRange> {
+    let mut out = Vec::new();
+    let mut a = r.start;
+    for c in cut {
+        if c.end() <= a || c.start >= r.end() {
+            continue;
+        }
+        if c.start > a {
+            out.push(TimeRange::from_bounds(a, c.start));
+        }
+        a = a.max(c.end());
+    }
+    if a < r.end() {
+        out.push(TimeRange::from_bounds(a, r.end()));
+    }
+    out
+}
+
+/// The parts of `r` inside `ranges` (sorted).
+fn intersect(r: TimeRange, ranges: &[TimeRange]) -> Vec<TimeRange> {
+    ranges
+        .iter()
+        .filter_map(|x| {
+            let (a, b) = (x.start.max(r.start), x.end().min(r.end()));
+            (b > a).then(|| TimeRange::from_bounds(a, b))
+        })
+        .collect()
+}
+
+/// The audio of the sequence as far as transcripts measured it: the silences of every transcribed
+/// clip on the audio tracks mapped to sequence time, read top first like the words (a clip on a
+/// higher track is what is heard where it plays).
+pub fn sequence_hearing(seq: &Sequence, transcripts: &Transcripts) -> Hearing {
+    let mut h = Hearing::default();
+    let mut claimed: Vec<TimeRange> = Vec::new();
+    for track in &seq.audio_tracks {
+        let mut mine = Vec::new();
+        for it in &track.items {
+            if !it.enabled || it.reverse || it.frame_hold.is_some() || it.speed <= 0.0 {
+                continue;
+            }
+            let Some(tr) = transcripts.get(&it.item) else { continue };
+            mine.push(it.range());
+            let Some(silences) = &tr.silences else { continue };
+            claimed.sort_by_key(|r| r.start);
+            let free = subtract(it.range(), &merge_ranges(claimed.clone()));
+            let speed = it.speed;
+            let to_tl = |m: Tick| it.start + ticks((m - it.source_in).0 as f64 / speed);
+            h.known.extend(free.iter().copied());
+            for sil in silences {
+                let (a, b) = (to_tl(sil.start).max(it.start), to_tl(sil.end()).min(it.end()));
+                if b > a {
+                    h.silent.extend(intersect(TimeRange::from_bounds(a, b), &free));
+                }
+            }
+        }
+        claimed.extend(mine);
+    }
+    h.silent = merge_ranges(h.silent);
+    h.known = merge_ranges(h.known);
+    h
+}
+
+/// How far a pause reaches into the words next to it where the audio there is silent: a word
+/// whose transcribed end is later than its sound (or start earlier) gives that time to the pause.
+pub const PAUSE_REACH_SECONDS: f64 = 0.5;
+
 /// A pause: the silence between word `after` of the sequence transcript and the next word (the
-/// Text panel shows it inline as "[...]").
+/// Text panel shows it inline as "[...]"). Where the audio was measured ([`Hearing`]) the pause
+/// is its silence: it starts where the sound of the word before it stops, ends where the next
+/// sound starts, and other sound between the words (a laugh) is not part of it ([`pause_spans`]).
+/// Otherwise it is the time between the words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pause {
     /// Index of the word before the pause.
     pub after: usize,
-    /// Sequence time: the end of word `after` and the start of the next word.
+    /// Sequence time: the first and the last silent moment (without measured audio: the end of
+    /// word `after` and the start of the next word).
     pub start: Tick,
     pub end: Tick,
+}
+
+/// The silent stretches of at least `min` between words `after` and `after + 1`: the measured
+/// silence touching the time between them (reaching up to [`PAUSE_REACH_SECONDS`] into the words
+/// where they are silent), and that time itself where nothing was measured.
+fn silent_spans(words: &[SeqWord], h: &Hearing, after: usize, min: Tick) -> Vec<TimeRange> {
+    let (Some(wa), Some(wb)) = (words.get(after), after.checked_add(1).and_then(|i| words.get(i))) else { return Vec::new() };
+    let (a, b) = (wa.end, wb.start);
+    if b <= a {
+        return Vec::new();
+    }
+    let gap = TimeRange::from_bounds(a, b);
+    let reach = ticks(PAUSE_REACH_SECONDS * TICKS_PER_SECOND as f64);
+    let window = TimeRange::from_bounds((a - reach).max(wa.start).min(a), (b + reach).min(wb.end).max(b));
+    let mut spans: Vec<TimeRange> = intersect(window, &h.silent).into_iter().filter(|r| r.start < b && r.end() > a).collect();
+    spans.extend(subtract(gap, &h.known));
+    merge_ranges(spans).into_iter().filter(|r| r.duration >= min.max(Tick(1))).collect()
+}
+
+/// The silent stretches of pause `p` of at least `min` (see [`Pause`]): what deleting it removes,
+/// less the silence kept next to the sound ([`pause_ranges`]).
+pub fn pause_spans(words: &[SeqWord], h: &Hearing, p: &Pause, min: Tick) -> Vec<TimeRange> {
+    silent_spans(words, h, p.after, min).into_iter().filter(|r| r.start >= p.start && r.end() <= p.end).collect()
+}
+
+/// The pause after word `after` with silence of at least `min` in it, as heard.
+pub fn pause_after_heard(words: &[SeqWord], h: &Hearing, after: usize, min: Tick) -> Option<Pause> {
+    let spans = silent_spans(words, h, after, min);
+    let (first, last) = (spans.first()?, spans.last()?);
+    Some(Pause { after, start: first.start, end: last.end() })
+}
+
+/// The pauses with a silence of at least `min` (and at least one tick), as heard, in order.
+pub fn pauses_heard(words: &[SeqWord], h: &Hearing, min: Tick) -> Vec<Pause> {
+    (0..words.len().saturating_sub(1)).filter_map(|i| pause_after_heard(words, h, i, min)).collect()
+}
+
+/// The timeline ranges removing `spans` (a pause's silence) except `keep` next to the sound on
+/// both sides of each, snapped inward to frames; spans with less than a frame left go.
+pub fn pause_ranges(spans: &[TimeRange], keep: Tick, rate: FrameRate) -> Vec<TimeRange> {
+    spans.iter().filter_map(|r| pause_range(&Pause { after: 0, start: r.start, end: r.end() }, keep, rate)).collect()
+}
+
+/// The pauses with a silence of at least `min`, as heard, as the ranges to remove: each silent
+/// stretch of at least `min` less `keep` next to the sound on both sides ([`pause_ranges`]).
+pub fn find_pauses_heard(words: &[SeqWord], h: &Hearing, min: Tick, keep: Tick, rate: FrameRate) -> Vec<TimeRange> {
+    pauses_heard(words, h, min).iter().flat_map(|p| pause_ranges(&pause_spans(words, h, p, min), keep, rate)).collect()
 }
 
 impl Pause {

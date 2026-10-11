@@ -7,7 +7,8 @@
 //! `cancel`; toolbar `search` (with a filter on: the pill naming it, a click goes back to text),
 //! `filter` (menu `filter.text|fillers|pauses|searchSettings`), `autoInOut`, `extract`, `lift`,
 //! `more` (menu `more.createCaptions|transcribe|viewOptions|autoScroll`); quick filters
-//! `quick.fillers|pauses` ("Pauses (12)"); results row `count`, `prev`, `next`, with the Pauses
+//! `quick.fillers|pauses` ("Pauses (12)"), `measureAudio` (a transcript whose audio was never
+//! measured: its pauses are only gaps between words); results row `count`, `prev`, `next`, with the Pauses
 //! filter `minPause` and `minPause.less|more`; delete row `deleteAll`, `deleteOne`,
 //! `deleteMode.extract|lift`; text `segment.<n>`, `word.<i>`, `pause.<i>` (the pause after word i).
 //! The Transcript View Options dialog:
@@ -102,7 +103,10 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if app.ui.transcript_sel.is_some_and(|(a, b)| a >= n || b >= n) {
         app.ui.transcript_sel = None;
     }
-    if app.ui.transcript.pause.is_some_and(|p| tx::pause_after(&words, p).is_none()) {
+    // where the transcribed audio is silent: pauses are silence (a laugh between words is none)
+    let hearing = filmcraft_engine::transcript::sequence_hearing(&app.session);
+    let min_span = filmcraft_engine::transcript::min_span();
+    if app.ui.transcript.pause.is_some_and(|p| tx::pause_after_heard(&words, &hearing, p, min_span).is_none()) {
         app.ui.transcript.pause = None;
     }
     let prefs = app.session.prefs.transcript.clone();
@@ -115,10 +119,14 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
 
     // ---- quick filters: Filler words and Pauses in one click, with how many there are
     let min_pause = filmcraft_engine::transcript::min_pause(&app.session, &json!({}));
-    let all_pauses = tx::pauses(&words, min_pause);
+    let all_pauses = tx::pauses_heard(&words, &hearing, min_pause);
     let filler_list = filmcraft_engine::transcript::filler_hits(&app.session, &words, &json!({}));
     let row = Rect::from_min_size(pos2(rect.min.x + 10.0, y), vec2(rect.width() - 20.0, 22.0));
-    quick_filters(app, ui, row, filler_list.len(), all_pauses.len());
+    // a transcript from before the audio was measured: its pauses are only the time between words
+    let unmeasured = job.is_none() && words.iter().any(|w| app.session.project.transcripts.get(&w.item).is_some_and(|t| t.silences.is_none()));
+    if quick_filters(app, ui, row, filler_list.len(), all_pauses.len(), unmeasured) {
+        actions.push(("transcript.measureAudio".into(), json!({"wait": false})));
+    }
     y = row.max.y + 6.0;
 
     // ---- search results: counter, ∧ ∨ (the pause length); Delete all, Delete, Extract / Lift
@@ -165,11 +173,21 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let pause_hits: BTreeSet<usize> = found.iter().filter_map(|m| if let Match::Pause(p) = m { Some(p.after) } else { None }).collect();
     let current_match = found.get(app.ui.transcript.current).copied();
     let fillers: BTreeSet<usize> = if prefs.filler_words || filter == Filter::Fillers { filler_list.into_iter().flatten().collect() } else { BTreeSet::new() };
-    let pauses: BTreeMap<usize, tx::Pause> =
-        if prefs.pauses || filter == Filter::Pauses { all_pauses.into_iter().map(|p| (p.after, p)).collect() } else { BTreeMap::new() };
+    // each shown pause and how long it is silent
+    let pauses: BTreeMap<usize, (tx::Pause, Tick)> = if prefs.pauses || filter == Filter::Pauses {
+        all_pauses
+            .into_iter()
+            .map(|p| {
+                let silent = tx::pause_spans(&words, &hearing, &p, min_span).iter().fold(Tick::ZERO, |a, r| a + r.duration);
+                (p.after, (p, silent))
+            })
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
     let ph = app.session.playhead();
     let rate = app.session.sequence_rate();
-    let playing_pause = pauses.values().find(|p| p.start <= ph && ph < p.end).map(|p| p.after);
+    let playing_pause = pauses.values().find(|(p, _)| p.start <= ph && ph < p.end).map(|(p, _)| p.after);
     let playing_word = playing_word(&words, ph, rate.frame_duration(), playing_pause.is_some());
     let df = app.session.active_sequence().is_some_and(|q| q.settings.drop_frame);
     let tc = |x: Tick| format_time(x, rate, df, TimeDisplay::Timecode, 48_000);
@@ -198,8 +216,8 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             for i in para.clone() {
                 let Some(w) = words.get(i) else { continue };
                 toks.push((Tok::Word(i), w.text.clone()));
-                if let Some(p) = pauses.get(&i) {
-                    toks.push((Tok::Pause(i), pause_text(p)));
+                if let Some((_, silent)) = pauses.get(&i) {
+                    toks.push((Tok::Pause(i), pause_text(*silent)));
                 }
             }
             let (mut x, mut row) = (0.0f32, 0.0f32);
@@ -345,9 +363,9 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
     if resp.hovered()
         && let Some(Tok::Pause(i)) = resp.hover_pos().and_then(hit)
-        && let Some(p) = pauses.get(&i)
+        && let Some((_, silent)) = pauses.get(&i)
     {
-        resp.clone().on_hover_text(tlf!("{seconds} seconds", seconds = format!("{:.1}", p.duration().seconds())));
+        resp.clone().on_hover_text(tlf!("{seconds} seconds", seconds = format!("{:.1}", silent.seconds())));
     }
     // automation: the visible words and pauses, the segment headers
     for p in &placed {
@@ -377,9 +395,10 @@ fn playing_word(words: &[SeqWord], ph: Tick, frame: Tick, in_pause: bool) -> Opt
     if w.end > ph || (!in_pause && words.get(i + 1).is_some_and(|n| n.start > ph)) { Some(i) } else { None }
 }
 
-/// A pause in the text: "[...]", with its length when it is a long one, so long pauses stand out.
-fn pause_text(p: &tx::Pause) -> String {
-    let secs = p.duration().seconds();
+/// A pause in the text: "[...]", with how long it is silent when that is long, so long pauses
+/// stand out.
+fn pause_text(silent: Tick) -> String {
+    let secs = silent.seconds();
     if secs >= LONG_PAUSE_SECONDS { format!("[... {secs:.1} s]") } else { "[...]".into() }
 }
 
@@ -414,7 +433,7 @@ fn select_pause(app: &mut FilmcraftApp, words: &[SeqWord], after: usize, actions
     app.ui.transcript.caret = Some(after);
     if app.session.prefs.transcript.auto_in_out {
         actions.push(("transcript.select".into(), json!({"pauseAfter": after})));
-    } else if let Some(p) = tx::pause_after(words, after) {
+    } else if let Some(p) = filmcraft_engine::transcript::pause_at(&app.session, words, after) {
         app.session.set_playhead(p.start);
     }
 }
@@ -435,7 +454,11 @@ fn clear_selection_marks(app: &mut FilmcraftApp, words: &[SeqWord], actions: &mu
     let rate = app.session.sequence_rate();
     let range = match (app.ui.transcript_sel, app.ui.transcript.pause) {
         (Some((a, b)), _) => tx::word_range(words, a, b, rate),
-        (None, Some(p)) => tx::pause_after(words, p).and_then(|p| tx::pause_range(&p, Tick::ZERO, rate)),
+        (None, Some(p)) => {
+            let hearing = filmcraft_engine::transcript::sequence_hearing(&app.session);
+            tx::pause_after_heard(words, &hearing, p, filmcraft_engine::transcript::min_span())
+                .and_then(|q| filmcraft_engine::transcript::pause_marks(&app.session, words, &hearing, &q))
+        }
         _ => None,
     };
     let Some(r) = range else { return };
@@ -605,8 +628,9 @@ fn toolbar(app: &mut FilmcraftApp, ui: &mut egui::Ui, bar: Rect, actions: &mut V
 
 /// Quick filters under the toolbar: "Filler words (3)" and "Pauses (12)" switch the search to that
 /// filter (a second click goes back to searching text), so finding every pause is one click and
-/// shows how many there are.
-fn quick_filters(app: &mut FilmcraftApp, ui: &mut egui::Ui, row: Rect, fillers: usize, pauses: usize) {
+/// shows how many there are. With `unmeasured`, "Measure audio" follows them; returns whether it
+/// was clicked.
+fn quick_filters(app: &mut FilmcraftApp, ui: &mut egui::Ui, row: Rect, fillers: usize, pauses: usize, unmeasured: bool) -> bool {
     let t = app.tokens;
     let mut x = row.min.x;
     for (f, id, label) in [
@@ -634,6 +658,23 @@ fn quick_filters(app: &mut FilmcraftApp, ui: &mut egui::Ui, row: Rect, fillers: 
         }
         x = r.max.x + 6.0;
     }
+    if !unmeasured {
+        return false;
+    }
+    // pauses follow the sound once the audio is measured (a laugh between words is no pause)
+    let label = tl!("Measure audio");
+    let galley = ui.painter().layout_no_wrap(label.to_string(), Tokens::ui(12.0), t.accent);
+    let r = Rect::from_min_size(pos2(x + 6.0, row.min.y), vec2(galley.size().x + 20.0, row.height()));
+    if r.max.x > row.max.x {
+        return false;
+    }
+    let resp = ui.interact(r, egui::Id::new("transcript-measure-audio"), Sense::click());
+    let p = ui.painter();
+    p.rect_filled(r, r.height() / 2.0, if resp.hovered() { t.hover } else { t.field_bg });
+    p.rect_stroke(r, r.height() / 2.0, Stroke::new(1.0, t.accent), egui::StrokeKind::Inside);
+    p.galley(pos2(r.min.x + 10.0, r.center().y - galley.size().y / 2.0), galley, t.accent);
+    app.auto.add("text.transcript.measureAudio", r, label);
+    resp.on_hover_text(tl!("Measure where the audio is silent, so pauses follow the sound and a laugh between words stays (the words are kept)")).clicked()
 }
 
 /// The results row: "3/33 results" with ∧ ∨ next to it; with the Pauses filter, the shortest pause

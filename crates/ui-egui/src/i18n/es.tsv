@@ -3535,6 +3535,9 @@
 	Loading speech model…	Cargando modelo de voz…
 	Match capitalization	Coincidir mayúsculas y minúsculas
 	Keep next to words	Conservar junto a las palabras
+	Measure Audio for Pauses	Medir el audio para las pausas
+	Measure audio	Medir el audio
+	Measure where the audio is silent, so pauses follow the sound and a laugh between words stays (the words are kept)	Medir dónde el audio está en silencio para que las pausas sigan al sonido y una risa entre palabras se conserve (las palabras se mantienen)
 	Minimum pause length	Duración mínima de pausa
 	More options	Más opciones
 	Next result	Resultado siguiente

@@ -540,9 +540,10 @@ impl Whisper {
         }
         words.sort_by_key(|w| w.0);
         let words = words.into_iter().flat_map(|w| w.1).collect();
-        let mut t = Transcript { language: language.unwrap_or_else(|| "en".into()), source: self.id.clone(), speakers: Vec::new(), words };
+        let mut t = Transcript { language: language.unwrap_or_else(|| "en".into()), source: self.id.clone(), speakers: Vec::new(), words, silences: None };
         t.normalize();
         crate::vad::tighten_words_speech(&speech, &mut t.words);
+        t.silences = Some(crate::vad::silences_from_speech(&speech));
         if opts.diarize && !t.words.is_empty() {
             if !progress(0.96, "Labelling speakers") {
                 return Err(SpeechError::Cancelled);

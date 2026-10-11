@@ -475,6 +475,24 @@ fn quick_filters_find_and_delete_every_pause_in_one_click() {
     assert!(d.ids("text.transcript.deleteAll").is_empty(), "no Delete row without a search");
 }
 
+/// A transcript from before the audio was measured (or one an agent set) has pauses only between
+/// words; "Measure audio" measures where the sound is silent, keeps the words, and goes away.
+#[test]
+fn measure_audio_upgrades_an_old_transcript() {
+    let mut d = Driver::transcript_tab();
+    d.set_transcript();
+    assert_eq!(d.exec("transcript.inspect", json!({}))["audioMeasured"], false);
+    assert_eq!(d.label("text.transcript.measureAudio"), "Measure audio");
+    let undo = d.app().session.history.undo.len();
+    d.click("text.transcript.measureAudio");
+    d.until("the audio measured", |d| d.app().session.project.transcripts.values().all(|t| t.silences.is_some()));
+    d.frames(3);
+    assert_eq!(d.exec("transcript.inspect", json!({}))["audioMeasured"], true);
+    assert!(d.ids("text.transcript.measureAudio").is_empty(), "nothing left to measure");
+    assert_eq!(d.words().len(), WORDS.len(), "the words are kept");
+    assert_eq!(d.app().session.history.undo.len(), undo + 1, "one undo step");
+}
+
 #[test]
 fn view_options_and_the_more_menu() {
     let mut d = Driver::transcript_tab();
