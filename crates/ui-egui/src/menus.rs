@@ -172,6 +172,9 @@ pub fn targets_source(app: &FilmcraftApp, params: &Value) -> bool {
 fn ui_params(id: &str) -> &'static str {
     const NOT_MONITOR: [&str; 6] = ["view.zoom", "view.theme.", "view.appearanceMode.", "view.dynamicAudioWaveforms", "view.programZoom", "view.sourceZoom"];
     let monitor_view = id.starts_with("view.") && !NOT_MONITOR.iter().any(|p| id.starts_with(p));
+    if id == "timeline.setTrackHeight" {
+        return r#"{"track": id|"V1"|"A2", "height"?: points, "delta"?: points, "reset"?: bool}"#;
+    }
     if monitor_view || id.starts_with("playback.") { r#"{"monitor":"source"|"program"?}"# } else { "{}" }
 }
 

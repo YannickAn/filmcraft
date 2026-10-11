@@ -773,7 +773,18 @@ impl Session {
         filmcraft_project::ProjectView {
             open_sequences: self.state.open_sequences.iter().copied().filter(is_seq).collect(),
             active_sequence: self.state.active_sequence.filter(is_seq),
-            sequences: self.state.timeline_views.iter().filter(|(id, _)| is_seq(id)).map(|(id, v)| (*id, *v)).collect(),
+            // the heights of tracks deleted since are left out
+            sequences: self
+                .state
+                .timeline_views
+                .iter()
+                .filter_map(|(id, v)| {
+                    let seq = self.project.sequence(*id)?;
+                    let mut v = v.clone();
+                    v.track_heights.retain(|t, _| seq.track(*t).is_some());
+                    Some((*id, v))
+                })
+                .collect(),
             playheads: self.state.playheads.iter().filter(|(id, _)| is_seq(id)).map(|(id, t)| (*id, *t)).collect(),
         }
     }

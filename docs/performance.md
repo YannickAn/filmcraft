@@ -744,6 +744,16 @@ The timeline is not a bottleneck: the whole app frame (all panels) costs ~3 ms w
 visible; it already culls clips outside the view. The waveform display gain no longer rescans the
 whole source's peaks for every clip every frame (cached per peak list).
 
+**Waveforms** (`crates/ui-egui/src/panels/waveform.rs`). Each audio stream (and each nested
+sequence's mix) is summarised once in the background: per channel and per 256 samples at 48 kHz,
+the peak and the RMS level as 16-bit fractions of +12 dBFS, plus coarser levels 4× apart. A pixel
+column reads 4–16 cells of the level that fits its width instead of every 256-sample peak under
+it, so drawing costs the same at any zoom: a two-hour stereo recording on a clip 1600 points wide
+takes 0.14 ms a frame instead of 2.3 ms (dev build, `cargo test -p filmcraft-ui-egui --lib
+perf_two_hours -- --ignored --nocapture`). Its summary is 14.4 MB (the earlier min/max list of
+the channels together was 10.8 MB). The outline is one triangle strip per lane with a one-point
+feather (five vertices a column), and silent stretches add no vertices.
+
 ### Export (8 s of 1080p23.976 H.264 + AAC source)
 
 | format | fps before → after | CPU ms/frame before → after |

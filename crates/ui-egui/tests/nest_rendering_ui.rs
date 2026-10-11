@@ -8,6 +8,7 @@ use filmcraft_engine::Session;
 use filmcraft_engine::project::ItemId;
 use filmcraft_ui_egui::FilmcraftApp;
 use filmcraft_ui_egui::control::ControlRequest;
+use filmcraft_ui_egui::panels::waveform::Waveform;
 use serde_json::{Value, json};
 
 struct Driver {
@@ -68,12 +69,12 @@ impl Driver {
 impl Driver {
     /// The cached waveform peaks of `item`, once `ready` accepts them (they are made in the
     /// background; drawing the Timeline asks for them).
-    fn peaks_when(&mut self, item: u64, ready: impl Fn(&[(f32, f32)]) -> bool) -> Vec<(f32, f32)> {
+    fn peaks_when(&mut self, item: u64, ready: impl Fn(&Waveform) -> bool) -> std::sync::Arc<Waveform> {
         for _ in 0..400 {
             self.frames(1);
             let got = self.app().tl.peaks.lock().unwrap().get(&(ItemId(item), 0)).cloned();
             if let Some(p) = got.filter(|p| ready(p)) {
-                return p.to_vec();
+                return p;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -81,8 +82,8 @@ impl Driver {
     }
 }
 
-fn loudest(peaks: &[(f32, f32)]) -> f32 {
-    peaks.iter().fold(0.0, |m, (lo, hi)| m.max(lo.abs()).max(hi.abs()))
+fn loudest(w: &Waveform) -> f32 {
+    w.peak()
 }
 
 /// Premiere draws a waveform on the sound clip of a nest. Here it is the nested sequence's mix,
@@ -94,7 +95,7 @@ fn the_sound_clip_of_a_nest_gets_a_waveform_of_its_sequence() {
     let clip = d.app().session.active_sequence().unwrap().video_tracks[0].items[1].clone();
     d.exec("timeline.select", json!({"clips": [clip.id.0]}));
     let nested = d.exec("clip.nest", json!({"name": "Inner"}))["sequence"].as_u64().unwrap();
-    // one peak per 256 samples at 48 kHz, for the nest's whole length, and not silent
+    // a cell per 256 samples at 48 kHz, for the nest's whole length, and not silent
     let peaks = d.peaks_when(nested, |p| !p.is_empty());
     let want = (clip.duration.seconds() * 48_000.0 / 256.0) as usize;
     assert!(peaks.len().abs_diff(want) <= 2, "{} peaks for {want}", peaks.len());

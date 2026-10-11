@@ -20,7 +20,7 @@ fn three_tabs() -> (Session, [ItemId; 3]) {
 }
 
 fn view(pps: f64, scroll: f64) -> SequenceView {
-    SequenceView { pps, scroll, v_scroll: 12.0, a_scroll: 7.0, video_track_h: 90.0, audio_track_h: 40.0 }
+    SequenceView { pps, scroll, v_scroll: 12.0, a_scroll: 7.0, video_track_h: 90.0, audio_track_h: 40.0, track_heights: Default::default() }
 }
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -107,6 +107,27 @@ fn a_saved_project_reopens_with_its_tabs_and_their_views() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A track made taller or shorter on its own (Alt + drag on its header) keeps its height in the
+/// project file; the height of a track deleted since is not written.
+#[test]
+fn single_track_heights_are_saved_with_the_project() {
+    let (mut s, [main, ..]) = three_tabs();
+    let q = s.project.sequence(main).unwrap();
+    let (v2, a1) = (q.video_tracks[1].id, q.audio_tracks[0].id);
+    let mut v = view(30.0, 0.0);
+    v.track_heights = [(v2, 150.0), (a1, 33.0), (filmcraft_project::TrackId(987_654), 90.0)].into();
+    s.state.timeline_views.insert(main, v.clone());
+    let dir = temp_dir("track-heights");
+    let path = dir.join("heights.fcproj").to_string_lossy().to_string();
+    s.execute("file.saveAs", json!({"path": path})).unwrap();
+
+    let mut t = Session::default();
+    t.execute("file.open", json!({"path": path})).unwrap();
+    v.track_heights.remove(&filmcraft_project::TrackId(987_654));
+    assert_eq!(t.state.timeline_views.get(&main), Some(&v));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Each sequence reopens with its playhead where it was left: the project file keeps one playhead
 /// per sequence beside the tabs and views.
 #[test]
@@ -177,7 +198,11 @@ fn a_damaged_view_in_a_project_file_is_cleaned_up_or_ignored() {
         "open_sequences": [c.0, 999_999, footage.0, c.0, b.0],
         "active_sequence": 999_999,
         "sequences": {
-            b.0.to_string(): {"pps": 1e300, "scroll": -5.0, "v_scroll": 1e30, "a_scroll": -1.0, "video_track_h": 0.0, "audio_track_h": 1e9},
+            b.0.to_string(): {
+                "pps": 1e300, "scroll": -5.0, "v_scroll": 1e30, "a_scroll": -1.0, "video_track_h": 0.0, "audio_track_h": 1e9,
+                // a height too big for an f32 reads as infinite
+                "track_heights": {"7": 1e39, "8": 0.0, "9": 1e9},
+            },
             "999999": {"pps": 40.0, "scroll": 0.0, "video_track_h": 60.0, "audio_track_h": 56.0},
             footage.0.to_string(): {"pps": 40.0, "scroll": 0.0, "video_track_h": 60.0, "audio_track_h": 56.0},
         },
@@ -192,9 +217,11 @@ fn a_damaged_view_in_a_project_file_is_cleaned_up_or_ignored() {
     assert_eq!(t.state.open_sequences, [c, b]);
     assert_eq!(t.state.active_sequence, Some(c), "an active tab that is not open: the first tab");
     assert_eq!(t.state.timeline_views.len(), 1);
-    let v = t.state.timeline_views[&b];
+    let v = &t.state.timeline_views[&b];
     assert!(v.pps <= 1e5 && v.scroll == 0.0 && v.v_scroll <= 1e6 && v.a_scroll == 0.0);
     assert!(v.video_track_h >= 8.0 && v.audio_track_h <= 600.0);
+    let heights: Vec<(u64, f32)> = v.track_heights.iter().map(|(t, h)| (t.0, *h)).collect();
+    assert_eq!(heights, [(8, 8.0), (9, 600.0)], "single track heights: in range, an infinite one dropped");
     // playheads: only sequences keep one, never before zero or past the bound, always on a frame
     let rate = |seq: ItemId| t.project.sequence(seq).unwrap().settings.frame_rate;
     assert_eq!(t.state.playheads.keys().copied().collect::<Vec<_>>(), {

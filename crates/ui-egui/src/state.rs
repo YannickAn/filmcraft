@@ -202,12 +202,32 @@ pub struct TimelineView {
     /// (`volume`, `pan`, `mute`, `send.<i>.level`, `fx.<slot>.<param>`).
     #[serde(default)]
     pub track_lanes: std::collections::BTreeMap<u64, String>,
+    /// Tracks with a height of their own (Alt + drag on a track header,
+    /// `timeline.setTrackHeight`), in points; any other track has its kind's height
+    /// (`video_track_h` / `audio_track_h`).
+    #[serde(default)]
+    pub track_heights: std::collections::BTreeMap<filmcraft_project::TrackId, f32>,
 }
+
+/// The range of a single track's height (Alt + drag on its header), in points.
+pub const MIN_TRACK_H: f32 = 22.0;
+pub const MAX_TRACK_H: f32 = 400.0;
 
 impl TimelineView {
     /// The zoom / scroll animation is still running (element rects are moving).
     pub fn animating(&self) -> bool {
         self.pps != self.target_pps || self.scroll != self.target_scroll
+    }
+
+    /// The height of a track: its own, else its kind's. Never below 1 point or not finite, however
+    /// the heights were set (a script, a project file).
+    pub fn track_height(&self, track: filmcraft_project::TrackId, kind: filmcraft_project::TrackKind) -> f32 {
+        let h = match self.track_heights.get(&track) {
+            Some(h) => *h,
+            None if kind == filmcraft_project::TrackKind::Video => self.video_track_h,
+            None => self.audio_track_h,
+        };
+        if h.is_finite() { h.clamp(1.0, 10_000.0) } else { MIN_TRACK_H }
     }
 }
 
@@ -230,6 +250,7 @@ impl Default for TimelineView {
             fit_pending: true,
             fit_empty: None,
             track_lanes: Default::default(),
+            track_heights: Default::default(),
         }
     }
 }
