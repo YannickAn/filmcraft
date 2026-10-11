@@ -136,6 +136,28 @@ sub-sample estimate, and two trust figures (`confidence` = peak / RMS of the cor
   sub-sample), a 0 dB SNR room with a strong echo, inverted polarity, unrelated signals
   (unreliable) and `max_lag`. Two 10-minute recordings: 2.4 s (release, one core).
 
+## Time-stretch (`stretch`)
+
+`TimeStretch::new(sample_rate, channels)` → `set_speed(speed)`, `reset(start)`,
+`process(out, pull)`: the sound of a stream played faster or slower at the same pitch (Program
+playback at J/K/L shuttle and slow-play speeds, with Preferences ▸ Audio ▸ "Maintain pitch while
+shuttling"). Interleaved, unlike the effects, because the playback path is.
+
+- WSOLA (Verhelst & Roelands, ICASSP 1993): 24 ms periodic-Hann segments at 50 % overlap; segment
+  `m` is centred where output frame `m × hop` lands at the speed played, then moved by up to ±10 ms
+  to the offset whose waveform best continues the previous segment (normalised cross-correlation).
+  Speed 1 reproduces the input exactly.
+- The search runs on the channel sum (channels stay in step), first decimated to ~12 kHz, then at
+  full rate around the coarse optimum: under 6 ms of CPU per second of stereo at 48 kHz, at any
+  speed (`stretching_runs_far_faster_than_real_time`).
+- Input is pulled contiguously in increasing order (the mixer keeps its effect state); backwards
+  playback feeds it the timeline reversed. Speeds are clamped to 1/16…16×; channel counts to 64;
+  odd or zero sample rates are treated as the nearest of 1–768 kHz. Memory is allocated by `new`.
+- Tested on sines at 0.25×–8× (frequency within 1 %, measured within 0.05 %; duration = 1 s /
+  speed; no level dips at the overlaps) and on a voice-like 118 Hz harmonic tone (fundamental
+  kept), block-size invariance, contiguous pulls tracking the speed across speed changes, and
+  hostile rates, channel counts, speeds, starts and buffers.
+
 ## Known limits
 
 - Effects assume ≤ the channel count they were built with; extra channels pass through

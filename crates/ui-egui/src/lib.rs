@@ -47,6 +47,7 @@ pub mod perf;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod play_ahead;
 pub mod scrub;
+pub mod shuttle;
 pub mod source_playback;
 pub mod state;
 pub mod theme;
@@ -852,18 +853,24 @@ impl FilmcraftApp {
 
     fn start_audio(&mut self) {
         let speed = self.playback.speed;
-        if (speed - 1.0).abs() > 1e-9 {
-            if let Some(a) = self.audio.as_mut() {
-                a.stop();
-            }
-            return;
-        }
         let Some(seq_id) = self.session.state.active_sequence else { return };
         let start_tick = self.session.playhead();
+        let keep_pitch = self.session.prefs.audio.maintain_pitch_shuttling;
         let Some(a) = self.audio.as_mut() else { return };
         let sr = a.sample_rate();
         let cursor = start_tick.to_units_floor(sr as i64);
         let mix = playback_mix(&self.session, seq_id, sr);
+        // J/K/L shuttle and slow play: the sound follows the speed, at its own pitch unless
+        // Settings ▸ Audio ▸ "Maintain pitch while shuttling" is off
+        let mix: Box<dyn FnMut(i64, &mut [f32], usize) + Send> = if (speed - 1.0).abs() <= 1e-9 {
+            Box::new(mix)
+        } else if let Some(shuttled) = shuttle::wrap(mix, cursor, speed, sr, keep_pitch) {
+            Box::new(shuttled)
+        } else {
+            // too fast or too slow for sound: the wall clock drives, silent
+            a.stop();
+            return;
+        };
         // the old stream stops before the new mixer resets the underrun counters
         a.stop();
         // Desktop: mix ahead on a thread so the device callback never waits on decoding.

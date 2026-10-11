@@ -13,6 +13,39 @@ the before/after comparison relies on. Each milestone below alternated base / af
 each); the most load-independent figure is the decoder's own cycle count (`proc_pid_rusage`
 instructions and cycles of a process, all threads summed).
 
+## Shuttle sound: time-stretched playback at 0.25×–8× (2026-10-11)
+
+Before, the Program monitor went silent at every speed but 1× (J/K/L shuttle, slow play). Now the
+sound follows the speed at its own pitch: the 1× mix is time-stretched by WSOLA on the play-ahead
+thread ([monitors.md](monitors.md#program-playback-speed-and-sound),
+`filmcraft_audio_dsp::stretch`). The question was whether that extra work fits the 200 ms lead.
+
+Windows 11, Intel Core i9-12900KF (24 threads), 64 GB, WASAPI default output; the **debug-profile**
+app (`opt-level` 1, dependencies 2), so the margins are pessimistic. Media: 60 s of 1920×1080
+25 fps H.264 with 48 kHz stereo AAC (ffmpeg `testsrc2` and a harmonic voice-like tone), one sequence
+made from it. Each speed played 6 s through the control channel (`ui.playback {action: "play",
+speed}`), forwards from 0:05 and backwards from 0:55; `perf.stats` → `playback.audio` and the
+picture's dropped frames:
+
+| speed | callbacks | underruns | missingFrames | minLeadMs | video dropped |
+|---|---|---|---|---|---|
+| 1× | 586 | 0 | 0 | 169 | 0 of 147 |
+| 2× | 589 | 0 | 0 | 169 | 1 of 295 |
+| 4× | 587 | 0 | 0 | 169 | 40 of 308 |
+| 8× | 585 | 0 | 0 | 169 | 82 of 351 |
+| −2× | 593 | 0 | 0 | 169 | 1 of 297 |
+| −4× | 592 | 0 | 0 | 169 | 117 of 355 |
+| 0.5× | 589 | 0 | 0 | 169 | 0 of 74 |
+| 0.25× | 591 | 0 | 0 | 169 | 0 of 37 |
+
+Changing speed while playing (1 → 2 → 4 → 2 → −1 → −2 → −4 → 0.25 → 8 → 1.5×, 1.2 s each) and
+±16× also played with 0 underruns. The ring never drained below 169 of its 200 ms at any speed, as
+at 1×: the stretch itself is cheap (10 s of 48 kHz stereo in 23 ms at 2× and 59 ms at 8×, input
+generation included, `stretch::tests::stretching_runs_far_faster_than_real_time`), and mixing the
+timeline 8× faster (decoding AAC at 8×, the timeline backwards in 8192-frame blocks) stays inside
+the lead. The dropped pictures at 4× and 8× are video decoding (1080p H.264 at 100–200 fps), not
+sound. Headless check of a project: `bench_audio <project.fcproj> --speed 4 [--varispeed]`.
+
 ## Memory of clips on a timeline (MEM1–MEM3)
 
 Measured on the desktop release build with `footprint`, `heap` and `malloc_history`

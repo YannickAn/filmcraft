@@ -4,14 +4,17 @@
 //!
 //! ```sh
 //! FILMCRAFT_DATA_DIR=/tmp/fc-bench cargo run --release -p filmcraft-ui-egui --example bench_audio -- \
-//!     "Project.fcproj" --seconds 20 [--sequence "One hero" …] [--mode direct|ahead|both] [--json out.json] [--wav dir]
+//!     "Project.fcproj" --seconds 20 [--sequence "One hero" …] [--mode direct|ahead|both] [--json out.json] [--wav dir] \
+//!     [--speed 2 [--varispeed]]
 //! ```
 //!
 //! `direct` mixes inside the device callback (how playback worked before sound was mixed ahead);
 //! `ahead` plays through [`play_ahead`] as the app does now. A callback that returns after its
 //! buffer was due is a dropout, and the device cycles it overran are lost. For `ahead` the ring's
 //! own underruns (silence played because the mixer fell behind) count too. `--wav` writes what a
-//! device would have played for each run, to listen to.
+//! device would have played for each run, to listen to. `--speed` plays at another speed as J/K/L
+//! shuttling does ([`shuttle`]: time-stretched at the same pitch, or `--varispeed` like tape);
+//! backwards from the end of the sequence.
 //!
 //! The simulated device thread runs at normal priority (CoreAudio's own I/O thread runs higher),
 //! so absolute counts are pessimistic for both modes; compare the modes on the same machine load.
@@ -23,6 +26,7 @@ use std::time::{Duration, Instant};
 use filmcraft_engine::Session;
 use filmcraft_project::ItemId;
 use filmcraft_ui_egui::play_ahead::{self, AudioStats};
+use filmcraft_ui_egui::shuttle;
 use serde_json::{Value, json};
 
 const SR: u32 = 48_000;
@@ -117,11 +121,21 @@ fn write_wav(path: &std::path::Path, samples: &[f32]) -> std::io::Result<()> {
     std::fs::write(path, b)
 }
 
-fn play(s: &Session, seq: ItemId, mode: &str, seconds: f64) -> Run {
-    let mut mix = filmcraft_ui_egui::playback_mix(s, seq, SR);
+fn play(s: &Session, seq: ItemId, mode: &str, seconds: f64, speed: f64, keep_pitch: bool) -> Run {
+    let mix = filmcraft_ui_egui::playback_mix(s, seq, SR);
+    // backwards from the end
+    let start = if speed < 0.0 { s.project.sequence(seq).map_or(0, |q| q.duration().to_units_floor(SR as i64)) } else { 0 };
+    let mut mix: Box<dyn FnMut(i64, &mut [f32], usize) + Send> = if (speed - 1.0).abs() <= 1e-9 {
+        Box::new(mix)
+    } else {
+        match shuttle::wrap(mix, start, speed, SR, keep_pitch) {
+            Some(m) => Box::new(m),
+            None => Box::new(|_: i64, buf: &mut [f32], _: usize| buf.fill(0.0)),
+        }
+    };
     match mode {
         "direct" => {
-            let mut cursor = 0i64;
+            let mut cursor = start;
             let mut fill = move |buf: &mut [f32], ch: usize| {
                 mix(cursor, buf, ch);
                 cursor += (buf.len() / ch) as i64;
@@ -130,7 +144,7 @@ fn play(s: &Session, seq: ItemId, mode: &str, seconds: f64) -> Run {
         }
         _ => {
             let stats = Arc::new(AudioStats::default());
-            let mut fill = play_ahead::spawn(mix, 0, SR, CH, stats.clone());
+            let mut fill = play_ahead::spawn(mix, start, SR, CH, stats.clone());
             let mut r = device(&mut *fill, seconds);
             r.ring_underruns = stats.underruns.load(Ordering::Relaxed);
             let min = stats.min_lead_frames.load(Ordering::Relaxed);
@@ -144,6 +158,7 @@ fn main() {
     filmcraft_platform::register();
     let mut args = std::env::args().skip(1);
     let (mut project, mut seconds, mut only, mut mode, mut json_out, mut wav_dir) = (None, 20.0, Vec::new(), "both".to_string(), None, None);
+    let (mut speed, mut keep_pitch) = (1.0, true);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--seconds" => seconds = args.next().and_then(|v| v.parse().ok()).unwrap_or(seconds),
@@ -151,11 +166,15 @@ fn main() {
             "--mode" => mode = args.next().unwrap_or(mode),
             "--json" => json_out = args.next(),
             "--wav" => wav_dir = args.next().map(std::path::PathBuf::from),
+            "--speed" => speed = args.next().and_then(|v| v.parse().ok()).unwrap_or(speed),
+            "--varispeed" => keep_pitch = false,
             p => project = Some(p.to_string()),
         }
     }
     let Some(project) = project else {
-        eprintln!("usage: bench_audio <project.fcproj> [--seconds N] [--sequence NAME] [--mode direct|ahead|both] [--json PATH] [--wav DIR]");
+        eprintln!(
+            "usage: bench_audio <project.fcproj> [--seconds N] [--sequence NAME] [--mode direct|ahead|both] [--json PATH] [--wav DIR] [--speed S [--varispeed]]"
+        );
         std::process::exit(2);
     };
     let mut s = Session::default();
@@ -173,9 +192,9 @@ fn main() {
     let mut out = Vec::<Value>::new();
     for (id, name) in &seqs {
         for m in &modes {
-            let r = play(&s, *id, m, seconds);
+            let r = play(&s, *id, m, seconds, speed, keep_pitch);
             if let Some(d) = &wav_dir
-                && let Err(e) = write_wav(&d.join(format!("{name} - {m}.wav")), &r.heard)
+                && let Err(e) = write_wav(&d.join(format!("{name} - {m} - {speed}x.wav")), &r.heard)
             {
                 eprintln!("{}: {e}", d.display());
             }
@@ -193,7 +212,7 @@ fn main() {
                 r.max_callback_ms,
                 lead
             );
-            out.push(json!({"sequence": name, "mode": m, "seconds": seconds, "callbacks": r.callbacks, "dropouts": r.dropouts(), "overruns": r.overruns, "late": r.late,
+            out.push(json!({"sequence": name, "mode": m, "speed": speed, "seconds": seconds, "callbacks": r.callbacks, "dropouts": r.dropouts(), "overruns": r.overruns, "late": r.late,
                 "lostMs": lost_ms, "ringUnderruns": r.ring_underruns, "maxCallbackMs": r.max_callback_ms, "minLeadMs": r.min_lead_ms}));
         }
     }
