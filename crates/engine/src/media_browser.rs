@@ -12,7 +12,7 @@
 //! | `mediaBrowser.favorite` | Add to / Remove from Favorites |
 //! | `mediaBrowser.clearRecent` | Clear Recent Directories |
 //! | `mediaBrowser.settings` | file types, view (list / thumbnails), columns (Edit Columns…), Import as Image Sequence, Hover Scrub, thumbnail size |
-//! | `mediaBrowser.import` | Import (the selection or `paths`; Project ▸ Ingest settings apply) |
+//! | `mediaBrowser.import` | Import (the selection or `paths`; folders become bins as when dropped on the Project panel; Project ▸ Ingest settings apply) |
 //! | `mediaBrowser.openInSource` | Open In Source Monitor (Shift+O) |
 //! | `mediaBrowser.probe` | a file's media properties (frame rate, duration, video / audio info), cached |
 //!
@@ -421,32 +421,89 @@ fn paths_p(s: &Session, p: &Value) -> Vec<String> {
     }
 }
 
-/// `mediaBrowser.import {paths?, bin?, imageSequence?}`: imports files (directories import their
-/// supported files, like dragging a folder in Premiere).
+/// `mediaBrowser.import {paths?, bin?, imageSequence?}`: imports the selected files and folders. A
+/// folder imports as one dropped on the Project panel does (`file.import`, see
+/// [`crate::folder_import`]): a bin of its name with its media, each sub-folder a bin inside it.
+/// With `imageSequence` (default: Import as Image Sequence), each image sequence among the selected
+/// numbered stills imports once, from its lowest selected frame; other files import as they are.
 fn import(s: &mut Session, p: &Value) -> Result<Value> {
     let paths = paths_p(s, p);
     if paths.is_empty() {
         return Err(bad("mediaBrowser.import", "select files in the Media Browser"));
     }
     let seq = bool_p(p, "imageSequence").unwrap_or(s.prefs.media_browser.import_as_image_sequence);
-    let mut files = Vec::new();
+    let (starts, rest) = if seq { sequence_starts(&*s.services, paths) } else { (Vec::new(), paths) };
+    let bin = u64_p(p, "bin");
+    let run = |s: &mut Session, paths: Vec<String>, seq: bool| {
+        let mut q = json!({"paths": paths, "imageSequence": seq});
+        if let Some(b) = bin {
+            q["bin"] = json!(b);
+        }
+        s.execute("file.import", q)
+    };
+    if starts.is_empty() {
+        return run(s, rest, false);
+    }
+    if rest.is_empty() {
+        return run(s, starts, true);
+    }
+    let sequences = run(s, starts, true);
+    let others = run(s, rest, false);
+    merge_imports(sequences, others)
+}
+
+/// The selected numbered stills that start image sequences (the lowest selected frame of each
+/// sequence, in selection order) and the other paths (folders, other files).
+fn sequence_starts(services: &dyn Services, paths: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let mut starts: Vec<(u64, String)> = Vec::new();
+    let mut index: std::collections::HashMap<(String, String, String), usize> = std::collections::HashMap::new();
+    let mut rest = Vec::new();
     for path in paths {
-        // a directory imports its media files (not recursive)
-        let is_dir = matches!(s.services.list_entries(&path), Some(Ok(_))) && kind_of(&path).is_none();
-        match list(&*s.services, &path, "all") {
-            Ok(entries) if is_dir => files.extend(entries.into_iter().filter(|e| !e.is_dir).map(|e| e.path)),
-            _ => files.push(path),
+        let Some(n) = filmcraft_media::sequence::Numbered::parse(&path).filter(|_| !services.is_dir(&path)) else {
+            rest.push(path);
+            continue;
+        };
+        match index.get(&(n.dir.clone(), n.prefix.clone(), n.suffix.clone())).and_then(|&i| starts.get_mut(i)) {
+            Some(start) if n.number < start.0 => *start = (n.number, path),
+            Some(_) => {}
+            None => {
+                index.insert((n.dir, n.prefix, n.suffix), starts.len());
+                starts.push((n.number, path));
+            }
         }
     }
-    // an image sequence imports from its first selected frame only
-    if seq {
-        files.truncate(1);
+    (starts.into_iter().map(|(_, p)| p).collect(), rest)
+}
+
+/// One result for the two `file.import`s of a selection with image sequences and other files:
+/// lists are joined and counts added; it fails only when both did.
+fn merge_imports(a: Result<Value>, b: Result<Value>) -> Result<Value> {
+    match (a, b) {
+        (Ok(mut a), Ok(b)) => {
+            if let (Some(a), Value::Object(b)) = (a.as_object_mut(), b) {
+                for (k, v) in b {
+                    match (a.get_mut(&k), v) {
+                        (Some(Value::Array(x)), Value::Array(y)) => x.extend(y),
+                        (Some(Value::Number(x)), Value::Number(y)) => {
+                            *x = x.as_u64().unwrap_or(0).saturating_add(y.as_u64().unwrap_or(0)).into();
+                        }
+                        (None, v) => {
+                            a.insert(k, v);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(a)
+        }
+        (Ok(mut v), Err(e)) | (Err(e), Ok(mut v)) => {
+            if let Some(errors) = v.as_object_mut().and_then(|o| o.entry("errors").or_insert_with(|| json!([])).as_array_mut()) {
+                errors.push(json!(e.to_string()));
+            }
+            Ok(v)
+        }
+        (Err(a), Err(b)) => Err(EngineError::Other(format!("{a}; {b}"))),
     }
-    let mut q = json!({"paths": files, "imageSequence": seq});
-    if let Some(b) = u64_p(p, "bin") {
-        q["bin"] = json!(b);
-    }
-    s.execute("file.import", q)
 }
 
 /// The project item that already references a file.
@@ -460,6 +517,9 @@ pub fn item_for_path(s: &Session, path: &str) -> Option<ItemId> {
 
 fn open_in_source(s: &mut Session, p: &Value) -> Result<Value> {
     let path = paths_p(s, p).into_iter().next().ok_or_else(|| bad("mediaBrowser.openInSource", "select a file in the Media Browser"))?;
+    if s.services.is_dir(&path) {
+        return Err(bad("mediaBrowser.openInSource", format!("{path} is a folder: select a file to open in the Source Monitor")));
+    }
     let item = match item_for_path(s, &path) {
         Some(i) => i,
         None => {

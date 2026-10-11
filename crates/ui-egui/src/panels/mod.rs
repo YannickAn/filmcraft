@@ -112,6 +112,9 @@ enum DragPayload {
     Effect(String),
     /// A graphics template (id, name) from Essential Graphics ▸ Browse.
     Template(String, String),
+    /// Files and folders from the Media Browser, imported where they are dropped (a selection
+    /// with folders: they become bins).
+    Paths(Vec<String>),
 }
 
 fn payload_id() -> egui::Id {
@@ -136,6 +139,15 @@ pub fn start_drag_template(ui: &egui::Ui, id: &str, name: &str) {
 pub fn dragged_template(ui: &egui::Ui) -> Option<String> {
     match payload(ui) {
         Some(DragPayload::Template(id, _)) => Some(id),
+        _ => None,
+    }
+}
+pub fn start_drag_paths(ui: &egui::Ui, paths: Vec<String>) {
+    ui.ctx().data_mut(|d| d.insert_temp(payload_id(), Some(DragPayloadBox(DragPayload::Paths(paths)))));
+}
+pub fn dragged_paths(ui: &egui::Ui) -> Option<Vec<String>> {
+    match payload(ui) {
+        Some(DragPayload::Paths(p)) => Some(p),
         _ => None,
     }
 }
@@ -182,6 +194,10 @@ pub fn drag_ghost(app: &FilmcraftApp, ui: &egui::Ui) {
                 format!("{name} · {mode} · {:.2} s", s.range.duration.seconds())
             }
             DragPayload::Template(_, name) => name.clone(),
+            DragPayload::Paths(p) => match p.as_slice() {
+                [one] => filmcraft_engine::media_browser::base_name(one),
+                more => tlf!("{n} items", n = more.len()),
+            },
             DragPayload::Effect(e) => match e.strip_prefix("preset:") {
                 Some(name) => name.to_string(),
                 None => filmcraft_project::find_effect(e).map(|d| d.name.to_string()).unwrap_or_default(),

@@ -6,8 +6,18 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
+use filmcraft_media::MediaKind;
+use filmcraft_project::{Bin, BinEntry};
+
 use crate::media_browser::{self, DirEntry, Volume, VolumeKind};
 use crate::{Services, Session};
+
+/// A small PNG (the numbered stills are frames of an image sequence).
+fn png() -> Vec<u8> {
+    let mut out = Vec::new();
+    image::RgbaImage::from_pixel(8, 8, image::Rgba([200, 99, 7, 255])).write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).unwrap();
+    out
+}
 
 /// An in-memory filesystem: directories and files (with bytes).
 #[derive(Default)]
@@ -23,21 +33,31 @@ impl FakeFs {
         for f in ["/home/me/Movies/b-roll.wav", "/home/me/Movies/A-interview.wav", "/home/me/Movies/notes.txt", "/home/me/Movies/.hidden.wav"] {
             files.insert(f.to_string(), wav.clone());
         }
-        for f in [
-            "/home/me/Movies/shot_0001.png",
-            "/home/me/Movies/shot_0002.png",
-            "/home/me/Movies/edit.edl",
-            "/home/me/Movies/subs.srt",
-            "/home/me/Movies/clip.mov",
-        ] {
+        for f in ["/home/me/Movies/shot_0001.png", "/home/me/Movies/shot_0002.png"] {
+            files.insert(f.to_string(), png());
+        }
+        for f in ["/home/me/Movies/edit.edl", "/home/me/Movies/subs.srt", "/home/me/Movies/clip.mov", "/Volumes/Card/DCIM/Day 2/log.txt"] {
             files.insert(f.to_string(), vec![0; 16]);
         }
-        files.insert("/Volumes/Card/DCIM/take1.wav".into(), wav);
+        // a camera card: DCIM/take1.wav, DCIM/Day 2/take2.wav (+ log.txt), DCIM/Empty
+        files.insert("/Volumes/Card/DCIM/take1.wav".into(), wav.clone());
+        files.insert("/Volumes/Card/DCIM/Day 2/take2.wav".into(), wav);
         FakeFs {
-            dirs: ["/", "/home", "/home/me", "/home/me/Movies", "/home/me/Movies/Selects", "/Volumes", "/Volumes/Card", "/Volumes/Card/DCIM"]
-                .iter()
-                .map(|d| d.to_string())
-                .collect(),
+            dirs: [
+                "/",
+                "/home",
+                "/home/me",
+                "/home/me/Movies",
+                "/home/me/Movies/Selects",
+                "/Volumes",
+                "/Volumes/Card",
+                "/Volumes/Card/DCIM",
+                "/Volumes/Card/DCIM/Day 2",
+                "/Volumes/Card/DCIM/Empty",
+            ]
+            .iter()
+            .map(|d| d.to_string())
+            .collect(),
             files: Mutex::new(files),
         }
     }
@@ -72,6 +92,9 @@ impl Services for FakeFs {
     fn list_dir(&self, dir: &str) -> Option<std::io::Result<Vec<String>>> {
         self.list_entries(dir).map(|r| r.map(|v| v.into_iter().map(|e| e.name).collect()))
     }
+    fn is_dir(&self, path: &str) -> bool {
+        self.dirs.iter().any(|d| d == path)
+    }
     fn volumes(&self) -> Vec<Volume> {
         vec![
             Volume { name: "Macintosh HD".into(), path: "/".into(), kind: VolumeKind::Local },
@@ -90,6 +113,26 @@ fn session() -> Session {
 
 fn names(v: &Value) -> Vec<String> {
     v["entries"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap().to_string()).collect()
+}
+
+/// The Project panel's bins (`name/`) and items, as sorted paths.
+fn tree(s: &Session) -> Vec<String> {
+    fn walk(s: &Session, b: &Bin, at: &str, out: &mut Vec<String>) {
+        for e in &b.children {
+            match e {
+                BinEntry::Item(i) => out.push(format!("{at}{}", s.project.item(*i).unwrap().name)),
+                BinEntry::Bin(b) => {
+                    let path = format!("{at}{}/", b.name);
+                    out.push(path.clone());
+                    walk(s, b, &path, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(s, &s.project.root, "", &mut out);
+    out.sort();
+    out
 }
 
 #[test]
@@ -204,10 +247,73 @@ fn import_the_selection_and_open_in_source() {
     // ... and imports a file not in the project yet
     s.execute("mediaBrowser.openInSource", json!({"path": "/Volumes/Card/DCIM/take1.wav"})).unwrap();
     assert_eq!(s.project.items.len(), n + 1);
-    // importing a folder imports its media files
+    // a folder is not opened in the Source Monitor
+    assert!(s.execute("mediaBrowser.openInSource", json!({"path": "/Volumes/Card/DCIM"})).is_err());
+    assert_eq!(s.project.items.len(), n + 1);
+}
+
+/// Importing a folder from the Media Browser does what dropping it on the Project panel does: the
+/// folder becomes a bin of its name and each sub-folder a bin inside it, with all their media
+/// (other files skipped, folders without media make no bin), as one undo step. It used to import
+/// the folder's own media files only, flat.
+#[test]
+fn importing_a_folder_makes_bins_of_it_and_its_sub_folders() {
     let mut s = session();
-    let r = s.execute("mediaBrowser.import", json!({"paths": ["/Volumes/Card/DCIM"]})).unwrap();
-    assert_eq!(r["items"].as_array().unwrap().len(), 1);
+    s.execute("mediaBrowser.navigate", json!({"path": "/Volumes/Card"})).unwrap();
+    s.execute("mediaBrowser.select", json!({"paths": ["/Volumes/Card/DCIM"]})).unwrap();
+    let r = s.execute("mediaBrowser.import", json!({})).unwrap();
+    assert_eq!(r["items"].as_array().unwrap().len(), 2, "{r}");
+    assert_eq!(r["bins"].as_array().unwrap().len(), 2, "{r}");
+    assert_eq!(r["skippedCount"], 1, "log.txt: {r}");
+    assert_eq!(tree(&s), ["DCIM/", "DCIM/Day 2/", "DCIM/Day 2/take2.wav", "DCIM/take1.wav"]);
+    // one undo step takes back the bins and the files
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.project.items.is_empty() && tree(&s).is_empty(), "{:?}", tree(&s));
+    // into a given bin, beside the other selected files; with Import as Image Sequence on too
+    // (it applies to selected stills, not to folders)
+    s.execute("mediaBrowser.settings", json!({"importAsImageSequence": true})).unwrap();
+    let cards = s.execute("file.newBin", json!({"name": "Cards"})).unwrap()["bin"].as_u64().unwrap();
+    let r = s.execute("mediaBrowser.import", json!({"paths": ["/Volumes/Card/DCIM", "/home/me/Movies/b-roll.wav"], "bin": cards})).unwrap();
+    assert_eq!(r["items"].as_array().unwrap().len(), 3, "{r}");
+    assert_eq!(tree(&s), ["Cards/", "Cards/DCIM/", "Cards/DCIM/Day 2/", "Cards/DCIM/Day 2/take2.wav", "Cards/DCIM/take1.wav", "Cards/b-roll.wav"]);
+    // File ▸ Import from Media Browser imports the selection the same way
+    let mut s = session();
+    s.execute("mediaBrowser.select", json!({"paths": ["/Volumes/Card/DCIM/Day 2"]})).unwrap();
+    s.execute("file.importFromMediaBrowser", json!({})).unwrap();
+    assert_eq!(tree(&s), ["Day 2/", "Day 2/take2.wav"]);
+    // a folder without media imports nothing and says so
+    let e = s.execute("mediaBrowser.import", json!({"paths": ["/Volumes/Card/DCIM/Empty"]})).unwrap_err();
+    assert!(e.to_string().contains("no media files"), "{e}");
+    assert_eq!(tree(&s), ["Day 2/", "Day 2/take2.wav"]);
+}
+
+/// Import as Image Sequence: each sequence among the selected numbered stills imports once, from
+/// its lowest selected frame; the other selected files and folders import as they are. It used to
+/// import only the first selected path (as a sequence, whatever it was).
+#[test]
+fn import_as_image_sequence_applies_to_the_selected_stills() {
+    let mut s = session();
+    s.execute("mediaBrowser.settings", json!({"importAsImageSequence": true})).unwrap();
+    let movies = |n: &str| format!("/home/me/Movies/{n}");
+    let paths = [movies("shot_0002.png"), movies("b-roll.wav"), movies("shot_0001.png"), "/Volumes/Card/DCIM/Day 2".to_string()];
+    let r = s.execute("mediaBrowser.import", json!({"paths": paths})).unwrap();
+    assert_eq!(r["imageSequences"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["items"].as_array().unwrap().len(), 3, "the sequence, b-roll.wav and take2.wav: {r}");
+    assert_eq!(r["skippedCount"], 1, "{r}");
+    assert_eq!(tree(&s), ["Day 2/", "Day 2/take2.wav", "b-roll.wav", "shot_0001.png"]);
+    let seq = s.project.items.values().find(|i| i.name == "shot_0001.png").unwrap();
+    assert_eq!(seq.as_media().unwrap().info.kind, MediaKind::ImageSequence);
+    // a file that fails beside a sequence is reported, the sequence still comes in
+    let mut s = session();
+    let r = s.execute("mediaBrowser.import", json!({"paths": [movies("shot_0001.png"), "/Volumes/Card/DCIM/Day 2/log.txt".to_string()], "imageSequence": true})).unwrap();
+    assert_eq!(r["items"].as_array().unwrap().len(), 1, "{r}");
+    assert!(r["errors"].as_array().unwrap().iter().any(|e| e.as_str().unwrap().contains("log.txt")), "{r}");
+    // off: the stills import one by one
+    let mut s = session();
+    s.execute("mediaBrowser.select", json!({"paths": [movies("shot_0001.png"), movies("shot_0002.png")]})).unwrap();
+    let r = s.execute("mediaBrowser.import", json!({})).unwrap();
+    assert_eq!(r["items"].as_array().unwrap().len(), 2, "{r}");
+    assert!(r.get("imageSequences").is_none(), "{r}");
 }
 
 #[test]
