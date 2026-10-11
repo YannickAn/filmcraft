@@ -13,10 +13,14 @@
 //!
 //! A run of sound in a gap between words (frames above the edge threshold of
 //! [`crate::vad::edge_threshold`], dips of up to 150 ms bridged, peaking above the speech threshold)
-//! is a laugh when two consecutive pulses in it are voiced and that close together. A cough is a
-//! burst of noise (unvoiced; in a fit, the bursts are further apart), a breath is quiet noise, a
-//! click is a single short burst. A single voiced "hm" or "ha" is one pulse and stays part of the
-//! pause; the recogniser usually writes those as words anyway.
+//! is a laugh when two consecutive pulses in it are voiced and that close together, and the run
+//! and both pulses are at most 25 dB below the loudest frame within a second and the speaker's
+//! voice in the clip (95th percentile of the levels). A cough is a burst of noise (unvoiced; in a fit, the bursts are further apart), a breath
+//! is quiet noise, a click is a single short burst. The room tone a noise gate lets fade out after
+//! a word wavers and hums (voiced pulses at a laugh's pace) but far below the voice; a click on
+//! such a hum is loud, but the frames voiced next to it are not. A single
+//! voiced "hm" or "ha" is one pulse and stays part of the pause; the recogniser usually writes
+//! those as words anyway.
 //!
 //! The laugh kept is its voice, from the first voiced frame to the last, with the soft sound joined
 //! to them as a word has it ([`crate::vad::fit_words_to_voice`]: at most 150 ms before, 120 ms
@@ -27,7 +31,7 @@ use filmcraft_project::Word;
 use filmcraft_time::{Tick, TimeRange};
 
 use crate::TICKS_PER_SAMPLE;
-use crate::vad::{edge_threshold, frame_centre, frame_db, periodicity, threshold};
+use crate::vad::{LOCAL_PEAK_FRAMES, edge_threshold, frame_centre, frame_db, local_peaks, periodicity, speech_level, threshold};
 
 /// 10 ms frames of 16 kHz audio.
 const FRAME: usize = 160;
@@ -49,6 +53,9 @@ const SOFT_START: usize = 15;
 const SOFT_END: usize = 12;
 const SOFT_START_DB: f32 = 35.0;
 const SOFT_END_DB: f32 = 30.0;
+/// A laugh peaks at most this far (dB) below the loudest frame near it (the voice it comes with):
+/// the room tone a noise gate lets fade out after a word wavers and hums, but far below that.
+const NEAR_VOICE_DB: f32 = 25.0;
 
 /// The laughs in the gaps between `words` (and before the first and after the last word) of
 /// `audio` (16 kHz mono), in media time, in order. See the module docs.
@@ -58,6 +65,9 @@ pub fn laughs(audio: &[f32], words: &[Word]) -> Vec<TimeRange> {
         return Vec::new();
     }
     let (th, edge) = (threshold(&db), edge_threshold(&db));
+    let near = local_peaks(&db, LOCAL_PEAK_FRAMES);
+    // the speaker's voice in the whole clip: a hum with no voice near it is no laugh either
+    let speech = speech_level(&db).unwrap_or(f32::NEG_INFINITY);
     let frame_ticks = TICKS_PER_SAMPLE * FRAME as i64;
     let n = db.len();
     let floor_frame = |t: Tick| usize::try_from(t.0.max(0) / frame_ticks).unwrap_or(usize::MAX).min(n);
@@ -78,8 +88,10 @@ pub fn laughs(audio: &[f32], words: &[Word]) -> Vec<TimeRange> {
         }
         for (s, e) in sound_runs(&db, a, b, edge) {
             let peak = db.get(s..e).into_iter().flatten().copied().fold(f32::NEG_INFINITY, f32::max);
+            let voice = near.get(s..e).into_iter().flatten().copied().fold(speech, f32::max);
             if peak >= th
-                && is_laugh(audio, &db, s, e)
+                && peak >= voice - NEAR_VOICE_DB
+                && is_laugh(audio, &db, s, e, voice - NEAR_VOICE_DB)
                 && let Some((ls, le)) = voice_of(audio, &db, s, e, th, edge)
             {
                 out.push(TimeRange::from_bounds(tick(ls), tick(le)));
@@ -130,10 +142,11 @@ fn voice_of(audio: &[f32], db: &[f32], s: usize, e: usize, th: f32, edge: f32) -
     Some((a, b))
 }
 
-/// Whether frames `s..e` hold two consecutive voiced pulses 100–400 ms apart.
-fn is_laugh(audio: &[f32], db: &[f32], s: usize, e: usize) -> bool {
+/// Whether frames `s..e` hold two consecutive voiced pulses 100–400 ms apart, each at or above
+/// `loud` dBFS.
+fn is_laugh(audio: &[f32], db: &[f32], s: usize, e: usize, loud: f32) -> bool {
     let pulses = pulses(db, s, e);
-    let voiced: Vec<bool> = pulses.iter().map(|&f| voiced_near(audio, f)).collect();
+    let voiced: Vec<bool> = pulses.iter().map(|&f| voiced_near(audio, db, f, loud)).collect();
     pulses.windows(2).zip(voiced.windows(2)).any(|(p, v)| {
         let gap = p.get(1).copied().unwrap_or(0).saturating_sub(p.first().copied().unwrap_or(0));
         v.iter().all(|x| *x) && (MIN_PULSE_GAP..=MAX_PULSE_GAP).contains(&gap)
@@ -174,9 +187,10 @@ fn pulses(db: &[f32], s: usize, e: usize) -> Vec<usize> {
     out
 }
 
-/// Whether the waveform around frame `f` (or the frames next to it) is voiced.
-fn voiced_near(audio: &[f32], f: usize) -> bool {
-    [f.saturating_sub(1), f, f.saturating_add(1)].iter().any(|&g| periodicity(audio, frame_centre(g)) >= VOICED)
+/// Whether frame `f` (or a frame next to it) is voiced and at least `loud` dBFS.
+fn voiced_near(audio: &[f32], db: &[f32], f: usize, loud: f32) -> bool {
+    // a frame that is loud and voiced itself: a click over a hum is loud next to voiced frames
+    [f.saturating_sub(1), f, f.saturating_add(1)].iter().any(|&g| db.get(g).is_some_and(|v| *v >= loud) && periodicity(audio, frame_centre(g)) >= VOICED)
 }
 
 #[cfg(test)]
@@ -284,7 +298,7 @@ mod tests {
         let db = frame_db(&audio);
         let p = pulses(&db, 140, 215);
         assert_eq!(p.len(), 4, "{p:?}");
-        assert!(p.iter().all(|&f| voiced_near(&audio, f)));
+        assert!(p.iter().all(|&f| voiced_near(&audio, &db, f, -60.0)));
     }
 
     #[test]
@@ -304,10 +318,42 @@ mod tests {
         let fit = runs.iter().find(|r| r.0 >= 215).copied().unwrap();
         let p = pulses(&db, fit.0, fit.1);
         assert_eq!(p.len(), 3, "{p:?}");
-        assert!(p.iter().all(|&f| !voiced_near(&audio, f)));
+        assert!(p.iter().all(|&f| !voiced_near(&audio, &db, f, -60.0)));
         let hm = runs.iter().find(|r| r.0 < 215).copied().unwrap();
         assert_eq!(pulses(&db, hm.0, hm.1).len(), 1);
-        assert!(voiced_near(&audio, pulses(&db, hm.0, hm.1)[0]));
+        assert!(voiced_near(&audio, &db, pulses(&db, hm.0, hm.1)[0], -60.0));
+    }
+
+    /// A noise gate lets the room tone fade out after a word: a hum that wavers (pulses 150 ms apart,
+    /// periodic as a voice is) but 35 dB below the voice. Fitted words end with their voice, so the
+    /// fade lies in the pause; it is no laugh (six were found in one recording).
+    #[test]
+    fn the_room_tone_fading_after_a_word_is_no_laugh() {
+        let mut audio = vec![0.0f32; at(4.0)];
+        let words = speak(&mut audio, &[(0.5, 1.2), (3.0, 3.6)]);
+        let fade: Vec<f32> = (0..at(0.6))
+            .map(|i| {
+                let t = i as f32 / SR as f32;
+                let waver = 1.0 + 0.8 * (2.0 * std::f32::consts::PI * t / 0.15).sin();
+                0.004 * waver * (2.0 * std::f32::consts::PI * 100.0 * t).sin() * 10f32.powf(-1.5 * t / 0.6)
+            })
+            .collect();
+        add(&mut audio, at(1.2), &fade);
+        assert_eq!(laughs(&audio, &words), Vec::<TimeRange>::new());
+    }
+
+    /// Mouse clicks 150-250 ms apart on a hum, two seconds from any word: the clicks are loud
+    /// pulses and the hum next to them repeats with a period, but neither is a laugh.
+    #[test]
+    fn clicks_on_a_hum_are_no_laugh() {
+        let mut audio = vec![0.0f32; at(6.0)];
+        let words = speak(&mut audio, &[(0.5, 1.2), (5.0, 5.6)]);
+        let hum: Vec<f32> = (0..at(1.2)).map(|i| 0.003 * (2.0 * std::f32::consts::PI * 100.0 * i as f32 / SR as f32).sin()).collect();
+        add(&mut audio, at(2.4), &hum);
+        for k in 0..5 {
+            add(&mut audio, at(2.6) + k * at(0.18), &[0.4, -0.35, 0.3, -0.2, 0.1]);
+        }
+        assert_eq!(laughs(&audio, &words), Vec::<TimeRange>::new());
     }
 
     #[test]

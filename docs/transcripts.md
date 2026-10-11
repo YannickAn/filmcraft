@@ -77,6 +77,25 @@ text ("00:00:02:22 - 00:00:05:08"); the speaker column is hidden while speakers 
   (a soft "s", "f", "h" at most 150 ms before, a final "s" or a fading end at most 120 ms after, a
   "t" released after its closure). So the cut lands next to the voice on both sides of a pause, and
   a breath with a gap before the voice goes with the pause.
+- **Recordings with a noise gate** (FilmCraft): many screen and voice recordings (OBS, Discord)
+  gate the microphone, so the pauses between sentences are dead air and the gate lets the room
+  tone fade out over a few hundred milliseconds after each sentence. The fade hums with a period
+  as a voice does, but far below it: voice is at most 40 dB below the loudest sound within a
+  second, so a word ends with its voice, not 300 ms into the fade. Around such pauses the
+  recogniser's times can be far off: it started the first word after a pause in the silence
+  before it (one word ran over 5.6 s of dead air, and the pause was never found), or put the last
+  word before a pause after the voice had ended. A word with no sound of its own goes to the
+  nearer sound next to it, and the transcript keeps its order. A loud, rough start (a creaky
+  voice, a plosive) stays in the word, up to 500 ms past where the recogniser put it; a long final "s" stays (it crosses zero far
+  more often than breath, which goes); the room tone fading after a word, and clicks on a hum,
+  are no laugh. Measured on 23 minutes of noise-gated German screen recordings (four clips,
+  Parakeet v3; pauses of 0.3 s or more, pauses in the audio being 0.3 s below −50 dBFS): words
+  lying over dead air 31 → 0, pauses in the audio the transcript missed 41 → 13 of 226 (the rest
+  are mostly just under 0.3 s between the words' sound); after a word at a pause, the sound left
+  past its last loud frame (per clip) median 50–90 ms → 40–70 ms and 90th percentile
+  140–220 ms → 110–180 ms (a final "ch" is as quiet and noisy as an exhale, so up to 120 ms of
+  either stays); a word starting before its sound, 90th percentile 60–110 ms → 10–40 ms; and
+  "laughs" 22 → 8 (the rest voiced: a laugh, a sigh, a hummed "hmm").
 - **A laugh in a pause stays** (FilmCraft): when a clip is transcribed, FilmCraft looks at the
   sound in the pauses between its words (`filmcraft_speech::laugh`). A laugh is voiced (the voice
   sounds, as on a vowel) and comes in pulses ("ha-ha-ha", 100–400 ms apart); a cough, clearing
@@ -87,7 +106,8 @@ text ("00:00:02:22 - 00:00:05:08"); the speaker column is hidden while speakers 
 - Transcripts made before this, or brought with `transcript.set` (unless they carry `laughs` and
   `audioAnalysis`), had no such look: a breath may hold a word's edge out in a pause and a laugh in
   a pause is cut, until "Analyze audio" (or `transcript.analyzeAudio`) looks; transcribing again
-  does too.
+  does too. "Analyze audio" shows again for transcripts analyzed before the noise-gate fixes
+  (`audioAnalysis` 1; the current look is 2).
 - Delete or Backspace with text or a pause selected **extracts** it (ripple delete, gaps close);
   Alt+Backspace **lifts** it (leaves a gap). Ctrl/Cmd+F goes to the search field; ← → ↑ ↓,
   Home / End (with Shift to extend) move the playhead word by word as in Premiere.
@@ -211,7 +231,9 @@ all three without Python and treats them as hostile input). How it works:
 - **Long audio** (more than 60 s) is cut in pauses into pieces of at most 60 s, each encoded on its
   own, so memory stays flat for clips of hours and no word is split or repeated at a join (see the
   `filmcraft_speech::parakeet` module docs). Runs of digital silence (below −80 dBFS) longer than
-  300 ms are shortened before encoding, with times mapped back exactly.
+  300 ms are shortened before encoding, with times mapped back exactly; a word the model starts
+  in the 300 ms kept of such a run is moved to its sound afterwards (see *Recordings with a noise
+  gate* above).
 
 Measured on 2026-10-10 on the development PC (i9-12900KF, 16 cores, CPU only, release build; other
 jobs were running, so speeds are conservative), against NVIDIA's NeMo toolkit as the reference and
@@ -254,6 +276,21 @@ and v2's English-only check. The `.nemo` readers have mutation-fuzz tests (trunc
 corrupt sizes) in the default test suite. Measured on 2026-10-01: `whisper-tiny`, English, 12.2 % WER over 797 words of
 the local speech samples (LibriSpeech read speech and dialogue clips) (about 9.5 minutes for the run in a release build on an
 Apple-silicon laptop CPU).
+
+**Tuning pause detection on a real recording.** The example `pause_lab` writes a clip's word bounds
+stage by stage as JSON (seconds): the recogniser's own (`raw`), after tightening (`tight`) and after
+FilmCraft's look at the audio (`fitted`, with `laughs`). `--raw=<earlier output>` reuses the
+recognised words, so a change to `crates/speech/src/vad.rs` or `laugh.rs` is tried in seconds:
+
+```sh
+ffmpeg -i clip.mp4 -map 0:a:0 -ar 16000 -ac 1 -f f32le clip.f32
+cargo run --release -p filmcraft-speech --features parakeet --example pause_lab -- <model dir> clip.f32 out.json
+cargo run --release -p filmcraft-speech --features parakeet --example pause_lab -- - clip.f32 out2.json --raw=out.json
+```
+
+Compare `fitted` with the audio: words lying over dead air (frames below −80 dBFS), quiet stretches
+in the audio with no pause in the transcript, and how far a pause's edges lie from the voice
+(waveform and spectrogram plots of the edges show what a number cannot: breath, clicks, a hum).
 
 Transcript view options and the panel's toggles are preferences (`prefs.set`): `transcript.fillerWords`,
 `transcript.pauses`, `transcript.minPauseLength` (0.1–3.0 s, default 0.75), `transcript.keepAfterWords`

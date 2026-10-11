@@ -86,8 +86,10 @@ pub struct Transcript {
 
 /// The current look at the audio behind a transcript (`filmcraft_speech::analyze_audio`): 1, the
 /// words fitted to their voice (a breath before or after a word is not part of it) and the laughs
-/// in the pauses found.
-pub const AUDIO_ANALYSIS: u32 = 1;
+/// in the pauses found; 2, as 1, and a word the recogniser placed in the silence next to its sound
+/// (or over the dead air of a noise gate) goes to its sound, the room tone a gate lets fade out
+/// after a sentence is neither voice nor laughter, and breath is no final "s".
+pub const AUDIO_ANALYSIS: u32 = 2;
 
 fn is_zero(v: &u32) -> bool {
     *v == 0
@@ -217,7 +219,7 @@ mod tests {
         // one looked at and without laughs says so
         let none = Transcript { laughs: Some(Vec::new()), audio_analysis: AUDIO_ANALYSIS, ..Default::default() };
         let json = serde_json::to_string(&none).unwrap();
-        assert!(json.contains("\"audioAnalysis\":1"), "{json}");
+        assert!(json.contains(&format!("\"audioAnalysis\":{AUDIO_ANALYSIS}")), "{json}");
         let back: Transcript = serde_json::from_str(&json).unwrap();
         assert_eq!((back.laughs, back.audio_analysis), (Some(Vec::new()), AUDIO_ANALYSIS));
     }

@@ -41,3 +41,7 @@ required-features = ["whisper"]
 [[example]]
 name = "parakeet"
 required-features = ["parakeet"]
+
+[[example]]
+name = "pause_lab"
+required-features = ["parakeet"]
