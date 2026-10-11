@@ -24,6 +24,7 @@ use crate::theme::Tokens;
 
 use super::timeline_hit::{EdgeKind, Grab, edge_geometry, grab_at};
 pub use super::timeline_hit::{Hit, ROLL_PX, hit, selection_trim_kind};
+use super::waveform::{self, Waveform};
 
 const TOP_H: f32 = 58.0; // timecode + toolbar (left) / ruler (right)
 const RULER_H: f32 = 44.0;
@@ -42,17 +43,14 @@ pub struct TlState {
     pub layout: Option<Layout>,
     /// Snap indicator x (screen) this frame.
     snap_x: Option<f32>,
-    /// Waveform peaks by media item and audio stream ([`PeakKey`]).
-    pub peaks: Arc<Mutex<HashMap<PeakKey, Arc<Vec<(f32, f32)>>>>>,
+    /// Waveforms by media item and audio stream ([`PeakKey`]).
+    pub peaks: Arc<Mutex<HashMap<PeakKey, Arc<Waveform>>>>,
     peaks_pending: Arc<Mutex<Vec<PeakKey>>>,
     /// Nested sequences have waveforms too, of their mix. Unlike media a sequence changes: this is
     /// the content key (see [`sequence_audio_key`]) the cached peaks of each sequence were made
     /// from, and the key worked out for the session revision last seen.
     seq_peak_keys: Arc<Mutex<HashMap<ItemId, u64>>>,
     seq_keys_seen: HashMap<ItemId, (u64, u64)>,
-    /// Source peak of each cached peak list (keyed by the list's address), for the waveform
-    /// display gain: scanning the whole source per clip per frame cost more than drawing.
-    peak_max: HashMap<PeakKey, (usize, f32)>,
     zoom_anchor: Option<(f64, f32)>,
     /// A track being made taller or shorter on its own (Alt + drag on its header).
     track_resize: Option<TrackResize>,
@@ -82,7 +80,6 @@ impl TlState {
         self.peaks_pending = Default::default();
         self.seq_peak_keys = Default::default();
         self.seq_keys_seen.clear();
-        self.peak_max.clear();
     }
 }
 
@@ -680,7 +677,7 @@ fn draw_clip(
             }
         }
     }
-    // waveform (audio): rectified, lower 40 %
+    // waveform (audio): rectified, below the name band
     if kind == TrackKind::Audio && app.ui.timeline.show_waveforms && w > 3.0 {
         draw_waveform(app, p, body, it, if inr { Color32::from_rgb(0xc7, 0xe9, 0xfa) } else { Color32::from_rgb(0x79, 0xc0, 0xf9) });
     }
@@ -738,69 +735,73 @@ fn draw_clip(
     }
 }
 
+/// An audio clip's waveform (see [`waveform`]): the peak and, lighter, the RMS level of its sound,
+/// times its Volume, on a dB scale unless View ▸ Dynamic Audio Waveforms is off; one lane per
+/// channel when the track is tall enough.
 fn draw_waveform(app: &mut FilmcraftApp, p: &egui::Painter, body: Rect, it: &TrackItem, col: Color32) {
-    let Some(peaks) = request_peaks(app, it.item, it.audio_stream) else { return };
-    let spp = 256.0;
-    let sr = 48_000.0;
-    let zone_h = (body.height() * 0.42).max(8.0);
-    let area = Rect::from_min_max(pos2(body.min.x + 1.0, body.max.y - zone_h - 1.0), pos2(body.max.x - 1.0, body.max.y - 1.0));
-    let clip = p.clip_rect().intersect(area);
-    if clip.width() <= 0.0 {
+    let Some(w) = request_peaks(app, it.item, it.audio_stream) else { return };
+    // the waveform fills the clip below its name band
+    let band = (body.height() * 0.4).min(16.0);
+    let zone = Rect::from_min_max(pos2(body.min.x + 1.0, body.min.y + band), pos2(body.max.x - 1.0, body.max.y - 1.0));
+    let clip = p.clip_rect().intersect(zone);
+    if clip.width() <= 0.0 || clip.height() <= 0.0 || w.is_empty() {
         return;
     }
-    let key = Arc::as_ptr(&peaks) as usize;
-    let peak = match app.tl.peak_max.get(&(it.item, it.audio_stream)) {
-        Some(&(k, v)) if k == key => v,
-        _ => {
-            let v = peaks.iter().fold(0f32, |m, (a, b)| m.max(a.abs()).max(b.abs()));
-            app.tl.peak_max.insert((it.item, it.audio_stream), (key, v));
-            v
-        }
-    };
-    let gain = waveform_display_gain(peak, it.gain_db);
-    let dynamic = app.ui.extras.dynamic_waveforms;
+    let log = app.ui.extras.dynamic_waveforms;
+    let gain = waveform_display_gain(w.peak(), it.gain_db, log);
+    let lanes = waveform::lanes(w.channels(), zone.height());
+    let lane_h = zone.height() / lanes as f32;
+    // per pixel column: the stretch of the source it shows (in cells of the waveform) and the
+    // clip's Volume there (as in Premiere, the waveform shows it)
+    let x0 = clip.min.x.floor();
+    let cols = ((clip.max.x.ceil() - x0).max(0.0) as usize).min(16_384);
+    let dur_px = body.width().max(1.0) as f64;
+    let cell = waveform::BUCKET as f64 / 48_000.0;
+    let at = |x: f32| it.start + Tick((it.duration.0 as f64 * ((x - body.min.x) as f64 / dur_px)) as i64);
+    let spans: Vec<(f64, f64, f32)> = (0..cols)
+        .map(|i| {
+            let (t0, t1) = (at(x0 + i as f32), at(x0 + i as f32 + 1.0));
+            (it.source_time_at(t0).seconds() / cell, it.source_time_at(t1).seconds() / cell, super::timeline_volume::gain_at(it, t0) * gain)
+        })
+        .collect();
+    let rms_col = lighten(col, 0.6);
     let mut mesh = egui::Mesh::default();
-    let dur_px = body.width().max(1.0);
-    for x in (clip.min.x.floor() as i32)..(clip.max.x.ceil() as i32) {
-        let f0 = (x as f32 - body.min.x) / dur_px;
-        let f1 = (x as f32 + 1.0 - body.min.x) / dur_px;
-        let t0 = it.start + Tick((it.duration.0 as f64 * f0 as f64) as i64);
-        let t1 = it.start + Tick((it.duration.0 as f64 * f1 as f64) as i64);
-        let s0 = (it.source_time_at(t0).seconds() * sr / spp) as usize;
-        let s1 = ((it.source_time_at(t1).seconds() * sr / spp) as usize).max(s0 + 1);
-        let mut m = 0f32;
-        for (a, b) in peaks.iter().skip(s0).take(s1 - s0) {
-            m = m.max(a.abs()).max(b.abs());
-        }
-        // as in Premiere, the waveform shows the clip's Volume
-        m *= super::timeline_volume::gain_at(it, t0);
-        // View ▸ Dynamic Audio Waveforms (default): logarithmic scale, −48 dB → 0, 0 dB → full;
-        // off: linear amplitude
-        let h = if dynamic {
-            let db = 20.0 * (m * gain).max(1e-5).log10();
-            ((db + 48.0) / 48.0).clamp(0.0, 1.0) * area.height()
-        } else {
-            (m * gain).clamp(0.0, 1.0) * area.height()
-        };
-        if h > 0.3 {
-            mesh.add_colored_rect(Rect::from_min_max(pos2(x as f32, area.max.y - h), pos2(x as f32 + 1.0, area.max.y)), col);
-        }
+    let mut columns = Vec::with_capacity(cols);
+    for lane in 0..lanes {
+        let channel = (lanes > 1).then_some(lane);
+        let h = (lane_h - 1.0).max(1.0);
+        columns.clear();
+        columns.extend(spans.iter().map(|&(a, b, g)| match w.level(channel, a, b) {
+            Some(l) => (waveform::display_height(l.peak * g, log) * h, waveform::display_height(l.rms * g, log) * h),
+            None => (0.0, 0.0),
+        }));
+        let base = zone.min.y + lane_h * (lane + 1) as f32;
+        waveform::paint_profile(&mut mesh, x0, &columns, base, -1.0, col, rms_col);
     }
     p.add(mesh);
-    // channel label box
-    let cb = Rect::from_min_size(pos2(body.min.x + 3.0, body.max.y - 11.0), vec2(8.0, 9.0));
-    if body.width() > 30.0 {
-        p.rect_filled(cb, 1.0, Color32::from_black_alpha(160));
-        p.text(cb.center(), Align2::CENTER_CENTER, "1", Tokens::ui(7.5), Color32::from_rgb(0xd9, 0xd9, 0xd9));
+    // a line between the lanes, and each lane's channel in a box at its bottom left
+    for lane in 0..lanes {
+        let bottom = zone.min.y + lane_h * (lane + 1) as f32;
+        if lane + 1 < lanes {
+            p.line_segment([pos2(zone.min.x, bottom - 0.5), pos2(zone.max.x, bottom - 0.5)], Stroke::new(1.0, Color32::from_black_alpha(110)));
+        }
+        if body.width() > 30.0 {
+            let name = if lanes > 1 { waveform::lane_name(lane, lanes) } else { "1".to_string() };
+            let cb = Rect::from_min_size(pos2(body.min.x + 3.0, bottom - 10.0), vec2(4.0 + 4.5 * name.chars().count() as f32, 9.0));
+            p.rect_filled(cb, 1.0, Color32::from_black_alpha(160));
+            p.text(cb.center(), Align2::CENTER_CENTER, name, Tokens::ui(7.5), Color32::from_rgb(0xd9, 0xd9, 0xd9));
+        }
     }
 }
 
-/// Display gain for a clip's waveform: clip gain, plus normalisation of the source to full scale
-/// so quiet recordings stay readable, but by at most +12 dB, so a near-silent track (room tone at
-/// −50 dBFS, a silent film's empty audio stream) does not look like a loud one.
-fn waveform_display_gain(source_peak: f32, clip_gain_db: f64) -> f32 {
+/// Display gain for a clip's waveform: its clip gain. On the logarithmic scale (dB, as Premiere's
+/// waveforms) that is all: quiet passages show anyway, and a quiet recording looks quieter than a
+/// loud one. On the linear scale the source is also normalised to full scale so quiet recordings
+/// stay readable, but by at most +12 dB, so a near-silent track (room tone at −50 dBFS, a silent
+/// film's empty audio stream) does not look like a loud one.
+fn waveform_display_gain(source_peak: f32, clip_gain_db: f64, logarithmic: bool) -> f32 {
     const MAX_BOOST: f32 = 3.981_072; // +12 dB
-    let boost = (1.0 / source_peak.max(1e-9)).min(MAX_BOOST);
+    let boost = if logarithmic { 1.0 } else { (1.0 / source_peak.max(1e-9)).min(MAX_BOOST) };
     filmcraft_render::audio::db_to_gain(clip_gain_db) * boost
 }
 
@@ -816,10 +817,10 @@ fn sequence_audio_key(project: &filmcraft_project::Project, item: ItemId) -> u64
     h.finish()
 }
 
-/// Waveform peaks of a nested sequence's mix, in the same form as a media item's (min, max per
-/// 256 samples at 48 kHz). They are mixed in the background, and again whenever the sequence's
-/// sound changes; until the new ones are ready the old ones stay on show.
-fn request_sequence_peaks(app: &mut FilmcraftApp, item: ItemId) -> Option<Arc<Vec<(f32, f32)>>> {
+/// The waveform of a nested sequence's mix, in the same form as a media item's. It is mixed in the
+/// background, and again whenever the sequence's sound changes; until the new one is ready the
+/// old one stays on show.
+fn request_sequence_peaks(app: &mut FilmcraftApp, item: ItemId) -> Option<Arc<Waveform>> {
     let revision = app.session.revision;
     let key = match app.tl.seq_keys_seen.get(&item) {
         Some(&(rev, key)) if rev == revision => key,
@@ -845,32 +846,32 @@ fn request_sequence_peaks(app: &mut FilmcraftApp, item: ItemId) -> Option<Arc<Ve
     let project = app.session.project.clone();
     let provider = app.session.media.provider(project.clone(), app.session.services.clone());
     let run = move || {
-        // a panic in the mix must not take the app down with it, nor leave the item pending for good
+        // a panic in the mix must not take the app down with it, nor leave the item pending for
+        // good; it leaves an empty waveform (asking again would only panic again)
         let mixed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let seq = project.sequence(item)?;
             let sr = seq.settings.sample_rate.max(1);
             let total = seq.duration().to_units_floor(sr as i64).max(0) as usize;
-            // one peak per 256 samples at 48 kHz, whatever the sequence's own rate
-            let bucket = ((256u64 * sr as u64) / 48_000).max(1) as usize;
+            // a cell per 256 samples at 48 kHz, whatever the sequence's own rate
+            let bucket = ((waveform::BUCKET as u64 * sr as u64) / 48_000).max(1) as usize;
             let chunk = (bucket * 750).max(1);
-            let mut out = Vec::with_capacity(total / bucket + 1);
+            let mut builder: Option<waveform::Builder> = None;
             let mut s = 0usize;
             while s < total {
                 let n = chunk.min(total - s);
                 let buf = filmcraft_render::audio::mix_sequence(&project, seq, s as i64, n, &provider);
-                let ch = buf.channels.first()?;
-                for c in ch.chunks(bucket) {
-                    let (lo, hi) = c.iter().fold((0f32, 0f32), |(l, h), v| (l.min(*v), h.max(*v)));
-                    out.push((lo, hi));
+                let b = builder.get_or_insert_with(|| waveform::Builder::new(buf.channels.len(), bucket));
+                b.push(&buf.channels);
+                if b.full() {
+                    break;
                 }
                 s += n;
             }
-            Some(out)
+            Some(builder.unwrap_or_else(|| waveform::Builder::new(1, bucket)).finish())
         }));
-        if let Ok(Some(out)) = mixed {
-            peaks.lock().unwrap_or_else(|e| e.into_inner()).insert((item, 0), Arc::new(out));
-            keys.lock().unwrap_or_else(|e| e.into_inner()).insert(item, key);
-        }
+        let w = mixed.ok().flatten().unwrap_or_default();
+        peaks.lock().unwrap_or_else(|e| e.into_inner()).insert((item, 0), Arc::new(w));
+        keys.lock().unwrap_or_else(|e| e.into_inner()).insert(item, key);
         pending.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| *k != (item, 0));
     };
     #[cfg(not(target_arch = "wasm32"))]
@@ -880,9 +881,9 @@ fn request_sequence_peaks(app: &mut FilmcraftApp, item: ItemId) -> Option<Arc<Ve
     have
 }
 
-/// The waveform peaks of audio stream `stream` of `item` (min/max over its channels per 256
-/// samples at 48 kHz), computed in the background: None until they are ready.
-pub(crate) fn request_peaks(app: &mut FilmcraftApp, item: ItemId, stream: usize) -> Option<Arc<Vec<(f32, f32)>>> {
+/// The waveform of audio stream `stream` of `item` (every channel, a cell per 256 samples at
+/// 48 kHz), made in the background: None until it is ready.
+pub(crate) fn request_peaks(app: &mut FilmcraftApp, item: ItemId, stream: usize) -> Option<Arc<Waveform>> {
     if app.session.project.sequence(item).is_some() {
         return request_sequence_peaks(app, item);
     }
@@ -903,29 +904,27 @@ pub(crate) fn request_peaks(app: &mut FilmcraftApp, item: ItemId, stream: usize)
     let pending = app.tl.peaks_pending.clone();
     let dur = src.info().duration;
     let run = move || {
-        let sr = 48_000u32;
-        let total = dur.to_units_floor(sr as i64).max(0) as usize;
-        let mut out = Vec::with_capacity(total / 256 + 1);
-        let chunk = 48_000 * 4;
-        let mut s = 0usize;
-        while s < total {
-            let n = chunk.min(total - s);
-            match src.audio_stream(stream, s as i64, n, sr) {
-                Ok(buf) => {
-                    // every channel: a voice recorded on one side of a stereo pair shows too
-                    let len = buf.channels.iter().map(Vec::len).max().unwrap_or(0);
-                    for a in (0..len).step_by(256) {
-                        let b = (a + 256).min(len);
-                        let (lo, hi) =
-                            buf.channels.iter().filter_map(|ch| ch.get(a..b.min(ch.len()))).flatten().fold((0f32, 0f32), |(l, h), v| (l.min(*v), h.max(*v)));
-                        out.push((lo, hi));
-                    }
+        // a decoder that panics leaves an empty waveform, not a dead job
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let sr = 48_000u32;
+            let total = dur.to_units_floor(sr as i64).max(0) as usize;
+            let chunk = 48_000 * 4;
+            let mut builder: Option<waveform::Builder> = None;
+            let mut s = 0usize;
+            while s < total {
+                let n = chunk.min(total - s);
+                let Ok(buf) = src.audio_stream(stream, s as i64, n, sr) else { break };
+                // every channel: a voice recorded on one side of a stereo pair shows too
+                let b = builder.get_or_insert_with(|| waveform::Builder::new(buf.channels.len(), waveform::BUCKET));
+                b.push(&buf.channels);
+                if b.full() {
+                    break;
                 }
-                Err(_) => break,
+                s += n;
             }
-            s += n;
-        }
-        peaks.lock().unwrap_or_else(|e| e.into_inner()).insert(key, Arc::new(out));
+            builder.unwrap_or_else(|| waveform::Builder::new(1, waveform::BUCKET)).finish()
+        }));
+        peaks.lock().unwrap_or_else(|e| e.into_inner()).insert(key, Arc::new(built.unwrap_or_default()));
         pending.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| *k != key);
     };
     #[cfg(not(target_arch = "wasm32"))]
@@ -1255,6 +1254,9 @@ fn draw_top(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, seq: &Sequenc
             egui::Popup::menu(&resp).show(|ui| {
                 ui.checkbox(&mut app.ui.timeline.show_thumbnails, tl!("Show Video Thumbnails"));
                 ui.checkbox(&mut app.ui.timeline.show_waveforms, tl!("Show Audio Waveform"));
+                // the same switch as View ▸ Dynamic Audio Waveforms
+                let lw = ui.checkbox(&mut app.ui.extras.dynamic_waveforms, tl!("Logarithmic Waveform Scaling"));
+                app.auto.add("timeline.settings.logWaveforms", lw.rect, "Logarithmic Waveform Scaling");
                 ui.separator();
                 let mut te = app.session.state.show_through_edits;
                 let c = ui.checkbox(&mut te, tl!("Show Through Edits"));
@@ -2467,15 +2469,26 @@ mod waveform_tests {
 
     #[test]
     fn normalisation_is_capped_for_near_silent_sources() {
-        // a −14 dBFS recording is normalised to full scale (+12 dB cap reached: −2 dBFS)
-        assert!((db(0.2 * waveform_display_gain(0.2, 0.0)) - (-2.0)).abs() < 0.1);
+        // linear scale: a −14 dBFS recording is normalised to full scale (+12 dB cap reached: −2 dBFS)
+        assert!((db(0.2 * waveform_display_gain(0.2, 0.0, false)) - (-2.0)).abs() < 0.1);
         // a −3 dBFS recording is normalised exactly
-        assert!((db(0.708 * waveform_display_gain(0.708, 0.0))).abs() < 0.1);
-        // a −52 dBFS "silent" stream stays near the floor of the −48 dB display range
-        assert!(db(0.0025 * waveform_display_gain(0.0025, 0.0)) < -39.0);
+        assert!((db(0.708 * waveform_display_gain(0.708, 0.0, false))).abs() < 0.1);
+        // a −52 dBFS "silent" stream stays near the floor
+        assert!(db(0.0025 * waveform_display_gain(0.0025, 0.0, false)) < -39.0);
         // digital silence does not blow up
-        assert!(waveform_display_gain(0.0, 0.0).is_finite());
+        assert!(waveform_display_gain(0.0, 0.0, false).is_finite());
         // clip gain still applies
-        assert!((db(waveform_display_gain(1.0, -6.0)) - (-6.0)).abs() < 0.1);
+        assert!((db(waveform_display_gain(1.0, -6.0, false)) - (-6.0)).abs() < 0.1);
+    }
+
+    /// On the dB scale loud and quiet recordings look different: no normalisation, clip gain only.
+    #[test]
+    fn the_log_scale_shows_the_level_as_recorded() {
+        assert_eq!(waveform_display_gain(0.2, 0.0, true), 1.0);
+        assert_eq!(waveform_display_gain(0.0025, 0.0, true), 1.0);
+        assert!((db(waveform_display_gain(0.5, -6.0, true)) - (-6.0)).abs() < 0.1);
+        let (quiet, loud) = (0.1f32, 0.9f32);
+        let h = |v: f32| super::waveform::display_height(v * waveform_display_gain(v, 0.0, true), true);
+        assert!(h(loud) - h(quiet) > 0.35, "−20 dBFS and −1 dBFS peaks: {} vs {}", h(quiet), h(loud));
     }
 }

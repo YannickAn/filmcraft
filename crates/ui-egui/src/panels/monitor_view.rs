@@ -576,24 +576,25 @@ pub fn waveform(
     let mid = area.center().y;
     p.line_segment([pos2(area.min.x, mid), pos2(area.max.x, mid)], Stroke::new(1.0, Color32::from_white_alpha(30)));
     match crate::panels::timeline::request_peaks(app, item, 0) {
-        Some(peaks) if !peaks.is_empty() => {
+        Some(w) if !w.is_empty() => {
+            // the peak and, lighter, the RMS level, mirrored about the middle (linear amplitude)
+            use crate::panels::waveform;
             let half = area.height() * 0.45;
-            let spp = 256.0 * TICKS_PER_SAMPLE_48K;
+            let cell = waveform::BUCKET as f64 * TICKS_PER_SAMPLE_48K;
+            let x0 = area.min.x.floor();
+            let cols = ((area.max.x.ceil() - x0).max(0.0) as usize).min(16_384);
+            let width = area.width().max(1.0) as f64;
+            let columns: Vec<(f32, f32)> = (0..cols)
+                .map(|i| {
+                    let f = |x: f32| dur * ((x - area.min.x) as f64 / width) / cell;
+                    let x = x0 + i as f32;
+                    w.level(None, f(x), f(x + 1.0)).map_or((0.0, 0.0), |l| (l.peak.min(1.0) * half, l.rms.min(1.0) * half))
+                })
+                .collect();
+            let (peak_col, rms_col) = (Color32::from_rgb(0x4f, 0xc3, 0x7a), Color32::from_rgb(0xa9, 0xe6, 0xbf));
             let mut mesh = egui::Mesh::default();
-            let col = Color32::from_rgb(0x4f, 0xc3, 0x7a);
-            for x in (area.min.x.floor() as i32)..(area.max.x.ceil() as i32) {
-                let f0 = (x as f32 - area.min.x) / area.width();
-                let f1 = (x as f32 + 1.0 - area.min.x) / area.width();
-                let s0 = (dur * f0 as f64 / spp) as usize;
-                let s1 = ((dur * f1 as f64 / spp) as usize).max(s0 + 1);
-                let (lo, hi) = peaks.iter().skip(s0).take(s1 - s0).fold((0f32, 0f32), |(l, h), (a, b)| (l.min(*a), h.max(*b)));
-                if hi - lo > 0.002 {
-                    mesh.add_colored_rect(
-                        Rect::from_min_max(pos2(x as f32, mid - hi.min(1.0) * half), pos2(x as f32 + 1.0, mid - lo.max(-1.0) * half + 1.0)),
-                        col,
-                    );
-                }
-            }
+            waveform::paint_profile(&mut mesh, x0, &columns, mid, -1.0, peak_col, rms_col);
+            waveform::paint_profile(&mut mesh, x0, &columns, mid, 1.0, peak_col, rms_col);
             p.add(mesh);
         }
         Some(_) => {
@@ -622,7 +623,7 @@ pub fn waveform(
     }
 }
 
-/// Ticks per 48 kHz sample (the waveform peaks are 256-sample min/max pairs at 48 kHz).
+/// Ticks per 48 kHz sample (a waveform has a cell per 256 samples at 48 kHz).
 const TICKS_PER_SAMPLE_48K: f64 = filmcraft_time::TICKS_PER_SECOND as f64 / 48_000.0;
 
 /// Comparison View: the reference side's label, timecode and step / set buttons.

@@ -8,6 +8,7 @@ use filmcraft_media::MediaSource;
 use filmcraft_project::{ItemId, ItemKind, Label, MediaClip, MediaRef};
 use filmcraft_time::FrameRate;
 use filmcraft_ui_egui::FilmcraftApp;
+use filmcraft_ui_egui::panels::waveform::Waveform;
 use serde_json::json;
 
 /// A sequence with a two-stream item on A1 (stream 0, bars and tone) and A2 (stream 1). The
@@ -46,8 +47,8 @@ fn two_streams() -> (Session, ItemId) {
     (s, item)
 }
 
-fn loudest(peaks: &[(f32, f32)]) -> f32 {
-    peaks.iter().fold(0.0, |m, (lo, hi)| m.max(lo.abs()).max(hi.abs()))
+fn loudest(w: &Waveform) -> f32 {
+    w.peak()
 }
 
 #[test]
