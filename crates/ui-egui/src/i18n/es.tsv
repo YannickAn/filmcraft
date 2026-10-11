@@ -3534,7 +3534,13 @@
 	Licence: {license}	Licencia: {license}
 	Loading speech model…	Cargando modelo de voz…
 	Match capitalization	Coincidir mayúsculas y minúsculas
-	Keep next to words	Conservar junto a las palabras
+	Keep after words	Conservar tras las palabras
+	Keep before words	Conservar antes de las palabras
+	laugh	risa
+	The laugh in it stays when the pause is deleted	La risa que contiene se conserva al eliminar la pausa
+	Find laughs	Buscar risas
+	Look for laughs in the pauses, so deleting a pause keeps them (the words stay)	Buscar risas en las pausas para que se conserven al eliminar una pausa (las palabras se mantienen)
+	Find Laughs in Pauses	Buscar risas en las pausas
 	Minimum pause length	Duración mínima de pausa
 	More options	Más opciones
 	Next result	Resultado siguiente

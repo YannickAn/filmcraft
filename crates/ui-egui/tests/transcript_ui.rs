@@ -192,10 +192,19 @@ impl Driver {
 
     /// A transcript brought by `transcript.set` (as an agent without a speech model would).
     fn set_transcript(&mut self) {
+        self.set_transcript_with_laughs(None);
+    }
+
+    /// [`Self::set_transcript`] with `laughs` (seconds from the clip's source In) looked for.
+    fn set_transcript_with_laughs(&mut self, laughs: Option<&[(f64, f64)]>) {
         let a = self.app().session.active_sequence().unwrap().audio_tracks[0].items[0].clone();
         let tk = |s: f64| (a.source_in + filmcraft_time::Tick::from_seconds_f64(s)).0;
         let words: Vec<Value> = WORDS.iter().map(|(w, s, e)| json!({"text": w, "start": tk(*s), "end": tk(*e)})).collect();
-        self.exec("transcript.set", json!({"item": a.item.0, "transcript": {"language": "en", "words": words}}));
+        let mut t = json!({"language": "en", "words": words});
+        if let Some(l) = laughs {
+            t["laughs"] = l.iter().map(|(s, e)| json!({"start": tk(*s), "duration": tk(*e) - tk(*s)})).collect();
+        }
+        self.exec("transcript.set", json!({"item": a.item.0, "transcript": t}));
         self.frames(3);
     }
 
@@ -381,9 +390,10 @@ fn clicking_selecting_pauses_and_delete_work_like_premiere() {
     d.ok("ui.key", json!({"key": "Backspace"}));
     d.frames(3);
     let after = d.app().session.active_sequence().unwrap().duration();
-    // the 1.1 s pause less 0.15 s kept next to each word (Keep next to words), frame-snapped inward
+    // the 1.1 s pause less 0.05 s kept after the word and 0.08 s before the next (Keep after /
+    // before words), frame-snapped inward
     let removed = (before - after).seconds();
-    assert!((0.7..=0.8).contains(&removed), "the pause is gone but for the silence next to the words: {removed} s");
+    assert!((0.88..=0.97).contains(&removed), "the pause is gone but for a little next to the words: {removed} s");
     assert!(d.ids("text.transcript.pause.").is_empty(), "what is left is shorter than a pause");
     assert_eq!(d.words().len(), WORDS.len(), "no word was cut");
     d.exec("edit.undo", json!({}));
@@ -475,6 +485,39 @@ fn quick_filters_find_and_delete_every_pause_in_one_click() {
     assert!(d.ids("text.transcript.deleteAll").is_empty(), "no Delete row without a search");
 }
 
+/// A transcript never looked at for laughs (an old one, or one an agent set) would cut a laugh in a
+/// pause; "Find laughs" looks for them in the audio, keeps the words, and goes away. A pause with
+/// a laugh in it says so, and deleting it keeps the laugh.
+#[test]
+fn find_laughs_and_a_pause_with_a_laugh() {
+    let mut d = Driver::transcript_tab();
+    d.set_transcript();
+    assert_eq!(d.exec("transcript.inspect", json!({}))["laughsChecked"], false);
+    assert_eq!(d.label("text.transcript.findLaughs"), "Find laughs");
+    let undo = d.app().session.history.undo.len();
+    d.click("text.transcript.findLaughs");
+    d.until("the laughs looked for", |d| d.app().session.project.transcripts.values().all(|t| t.laughs.is_some()));
+    d.frames(3);
+    assert_eq!(d.exec("transcript.inspect", json!({}))["laughsChecked"], true);
+    assert!(d.ids("text.transcript.findLaughs").is_empty(), "nothing left to look at");
+    assert_eq!(d.words().len(), WORDS.len(), "the words are kept");
+    assert_eq!(d.app().session.history.undo.len(), undo + 1, "one undo step");
+    // a laugh 2.6–3.0 s in the 1.1 s pause after "friend." (as a recogniser would find it)
+    d.set_transcript_with_laughs(Some(&[(2.6, 3.0)]));
+    assert_eq!(d.label("text.transcript.pause.3"), "[... 1.1 s · laugh]");
+    let laugh = |d: &mut Driver| d.exec("transcript.inspect", json!({}))["laughs"][0].clone();
+    let before = laugh(&mut d);
+    d.click("text.transcript.pause.3");
+    d.ok("ui.set", json!({"focused": "Text"}));
+    d.ok("ui.key", json!({"key": "Backspace"}));
+    d.frames(3);
+    let after = laugh(&mut d);
+    let len = |v: &Value| v["end"].as_i64().unwrap() - v["start"].as_i64().unwrap();
+    assert_eq!(len(&after), len(&before), "the laugh plays whole");
+    assert!(after["start"].as_i64() < before["start"].as_i64(), "the silence before it is gone");
+    assert_eq!(d.words().len(), WORDS.len(), "no word was cut");
+}
+
 #[test]
 fn view_options_and_the_more_menu() {
     let mut d = Driver::transcript_tab();
@@ -482,20 +525,21 @@ fn view_options_and_the_more_menu() {
     d.click("text.transcript.more");
     assert_eq!(d.ids("text.transcript.more.").len(), 4);
     d.click("text.transcript.more.viewOptions");
-    for id in ["fillerWords", "pauses", "minPauseLength", "pauseHandle", "wholeWords", "matchCase", "save", "cancel"] {
+    for id in ["fillerWords", "pauses", "minPauseLength", "keepAfterWords", "keepBeforeWords", "wholeWords", "matchCase", "save", "cancel"] {
         assert_eq!(d.ids(&format!("transcriptViewOptions.{id}")).len(), 1, "{id}");
     }
-    // a shorter minimum pause length shows more pauses; Save keeps it in the preferences, and the
-    // silence a deleted pause keeps next to the words (Keep next to words) too
+    // a shorter minimum pause length shows more pauses; Save keeps it in the preferences, and what
+    // a deleted pause keeps next to the words (Keep after words, Keep before words) too
     let mut draft = d.app().ui.transcript.view_options.clone().unwrap();
     assert_eq!(draft.min_pause_length, 0.75, "Premiere's default");
-    assert_eq!(draft.pause_handle, 0.15);
+    assert_eq!((draft.keep_after_words, draft.keep_before_words), (0.05, 0.08));
     draft.min_pause_length = 0.15;
-    draft.pause_handle = 0.05;
+    draft.keep_after_words = 0.02;
+    draft.keep_before_words = 0.1;
     d.ok("ui.set", json!({"transcript": {"viewOptions": serde_json::to_value(&draft).unwrap()}}));
     d.click("transcriptViewOptions.save");
-    assert_eq!(d.app().session.prefs.transcript.min_pause_length, 0.15);
-    assert_eq!(d.app().session.prefs.transcript.pause_handle, 0.05);
+    let t = &d.app().session.prefs.transcript;
+    assert_eq!((t.min_pause_length, t.keep_after_words, t.keep_before_words), (0.15, 0.02, 0.1));
     assert!(d.app().ui.transcript.view_options.is_none());
     assert_eq!(d.ids("text.transcript.pause.").len(), 2, "{:?}", d.ids("text.transcript.pause."));
     // { } off: a selection marks no In/Out
@@ -571,4 +615,9 @@ fn transcript_panel_screenshots() {
     d.snapshot("more-menu", None);
     d.click("text.transcript.more.viewOptions");
     d.snapshot("view-options", Some(egui::Id::new("transcript-view-options")));
+    d.click("transcriptViewOptions.cancel");
+    // a pause with a laugh in it (the transcript above was never looked at: "Find laughs" shows)
+    d.ok("ui.set", json!({"transcriptSearch": ""}));
+    d.set_transcript_with_laughs(Some(&[(2.6, 3.0)]));
+    d.snapshot("laugh-in-pause", None);
 }

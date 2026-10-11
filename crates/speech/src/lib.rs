@@ -19,6 +19,7 @@
 //! - [`diarize`]: speaker labelling by clustering per-chunk MFCC statistics (classical, no model).
 //! - [`mel`]: the log-mel front end shared by Whisper and diarization.
 //! - [`vad`]: energy-based tightening of word bounds (keeps pauses out of words).
+//! - [`laugh`]: laughs in the pauses between words (kept when a pause is deleted).
 //!
 //! See `docs/transcripts.md` for the user-facing behaviour and accuracy numbers.
 
@@ -26,6 +27,7 @@
 
 pub mod ct2;
 pub mod diarize;
+pub mod laugh;
 pub mod mel;
 pub mod models;
 pub mod nemo;

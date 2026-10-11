@@ -7,11 +7,12 @@
 //! `cancel`; toolbar `search` (with a filter on: the pill naming it, a click goes back to text),
 //! `filter` (menu `filter.text|fillers|pauses|searchSettings`), `autoInOut`, `extract`, `lift`,
 //! `more` (menu `more.createCaptions|transcribe|viewOptions|autoScroll`); quick filters
-//! `quick.fillers|pauses` ("Pauses (12)"); results row `count`, `prev`, `next`, with the Pauses
+//! `quick.fillers|pauses` ("Pauses (12)"), `findLaughs` (a transcript never looked at for laughs:
+//! its pauses would be cut whole); results row `count`, `prev`, `next`, with the Pauses
 //! filter `minPause` and `minPause.less|more`; delete row `deleteAll`, `deleteOne`,
 //! `deleteMode.extract|lift`; text `segment.<n>`, `word.<i>`, `pause.<i>` (the pause after word i).
 //! The Transcript View Options dialog:
-//! `transcriptViewOptions.fillerWords|pauses|minPauseLength|pauseHandle|wholeWords|matchCase|save|cancel`.
+//! `transcriptViewOptions.fillerWords|pauses|minPauseLength|keepAfterWords|keepBeforeWords|wholeWords|matchCase|save|cancel`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -118,7 +119,11 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let all_pauses = tx::pauses(&words, min_pause);
     let filler_list = filmcraft_engine::transcript::filler_hits(&app.session, &words, &json!({}));
     let row = Rect::from_min_size(pos2(rect.min.x + 10.0, y), vec2(rect.width() - 20.0, 22.0));
-    quick_filters(app, ui, row, filler_list.len(), all_pauses.len());
+    // a transcript never looked at for laughs: deleting its pauses would cut a laugh in them
+    let unchecked = job.is_none() && !filmcraft_engine::transcript::laughs_checked(&app.session, &words);
+    if quick_filters(app, ui, row, filler_list.len(), all_pauses.len(), unchecked) {
+        actions.push(("transcript.findLaughs".into(), json!({"wait": false})));
+    }
     y = row.max.y + 6.0;
 
     // ---- search results: counter, ∧ ∨ (the pause length); Delete all, Delete, Extract / Lift
@@ -165,11 +170,16 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let pause_hits: BTreeSet<usize> = found.iter().filter_map(|m| if let Match::Pause(p) = m { Some(p.after) } else { None }).collect();
     let current_match = found.get(app.ui.transcript.current).copied();
     let fillers: BTreeSet<usize> = if prefs.filler_words || filter == Filter::Fillers { filler_list.into_iter().flatten().collect() } else { BTreeSet::new() };
-    let pauses: BTreeMap<usize, tx::Pause> =
-        if prefs.pauses || filter == Filter::Pauses { all_pauses.into_iter().map(|p| (p.after, p)).collect() } else { BTreeMap::new() };
+    let laughs = filmcraft_engine::transcript::sequence_laughs(&app.session);
+    // each pause with whether a laugh is in it (it stays when the pause is deleted)
+    let pauses: BTreeMap<usize, (tx::Pause, bool)> = if prefs.pauses || filter == Filter::Pauses {
+        all_pauses.into_iter().map(|p| (p.after, (p, !tx::pause_laughs(&p, &laughs).is_empty()))).collect()
+    } else {
+        BTreeMap::new()
+    };
     let ph = app.session.playhead();
     let rate = app.session.sequence_rate();
-    let playing_pause = pauses.values().find(|p| p.start <= ph && ph < p.end).map(|p| p.after);
+    let playing_pause = pauses.values().find(|(p, _)| p.start <= ph && ph < p.end).map(|(p, _)| p.after);
     let playing_word = playing_word(&words, ph, rate.frame_duration(), playing_pause.is_some());
     let df = app.session.active_sequence().is_some_and(|q| q.settings.drop_frame);
     let tc = |x: Tick| format_time(x, rate, df, TimeDisplay::Timecode, 48_000);
@@ -198,8 +208,8 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             for i in para.clone() {
                 let Some(w) = words.get(i) else { continue };
                 toks.push((Tok::Word(i), w.text.clone()));
-                if let Some(p) = pauses.get(&i) {
-                    toks.push((Tok::Pause(i), pause_text(p)));
+                if let Some((p, laugh)) = pauses.get(&i) {
+                    toks.push((Tok::Pause(i), pause_text(p, *laugh)));
                 }
             }
             let (mut x, mut row) = (0.0f32, 0.0f32);
@@ -345,9 +355,10 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
     if resp.hovered()
         && let Some(Tok::Pause(i)) = resp.hover_pos().and_then(hit)
-        && let Some(p) = pauses.get(&i)
+        && let Some((p, laugh)) = pauses.get(&i)
     {
-        resp.clone().on_hover_text(tlf!("{seconds} seconds", seconds = format!("{:.1}", p.duration().seconds())));
+        let secs = tlf!("{seconds} seconds", seconds = format!("{:.1}", p.duration().seconds()));
+        resp.clone().on_hover_text(if *laugh { format!("{secs}. {}", tl!("The laugh in it stays when the pause is deleted")) } else { secs });
     }
     // automation: the visible words and pauses, the segment headers
     for p in &placed {
@@ -356,7 +367,8 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
         match p.tok {
             Tok::Word(i) => app.auto.add(&format!("text.transcript.word.{i}"), p.rect, words.get(i).map_or("", |w| w.text.as_str())),
-            Tok::Pause(i) => app.auto.add(&format!("text.transcript.pause.{i}"), p.rect, "[...]"),
+            // as shown: "[...]", "[... 2.4 s]", "[... 1.1 s · laugh]"
+            Tok::Pause(i) => app.auto.add(&format!("text.transcript.pause.{i}"), p.rect, p.galley.text()),
         }
     }
     for (pi, r) in segment_rects {
@@ -377,10 +389,16 @@ fn playing_word(words: &[SeqWord], ph: Tick, frame: Tick, in_pause: bool) -> Opt
     if w.end > ph || (!in_pause && words.get(i + 1).is_some_and(|n| n.start > ph)) { Some(i) } else { None }
 }
 
-/// A pause in the text: "[...]", with its length when it is a long one, so long pauses stand out.
-fn pause_text(p: &tx::Pause) -> String {
+/// A pause in the text: "[...]", with its length when it is a long one, so long pauses stand out,
+/// and "laugh" when one is in it (it stays when the pause is deleted).
+fn pause_text(p: &tx::Pause, laugh: bool) -> String {
     let secs = p.duration().seconds();
-    if secs >= LONG_PAUSE_SECONDS { format!("[... {secs:.1} s]") } else { "[...]".into() }
+    match (secs >= LONG_PAUSE_SECONDS, laugh) {
+        (true, true) => format!("[... {secs:.1} s · {}]", tl!("laugh")),
+        (true, false) => format!("[... {secs:.1} s]"),
+        (false, true) => format!("[... {}]", tl!("laugh")),
+        (false, false) => "[...]".into(),
+    }
 }
 
 trait SubAbs {
@@ -435,7 +453,15 @@ fn clear_selection_marks(app: &mut FilmcraftApp, words: &[SeqWord], actions: &mu
     let rate = app.session.sequence_rate();
     let range = match (app.ui.transcript_sel, app.ui.transcript.pause) {
         (Some((a, b)), _) => tx::word_range(words, a, b, rate),
-        (None, Some(p)) => tx::pause_after(words, p).and_then(|p| tx::pause_range(&p, Tick::ZERO, rate)),
+        (None, Some(p)) => tx::pause_after(words, p).and_then(|p| {
+            let s = &app.session;
+            tx::cuts_extent(&tx::pause_cuts(
+                &p,
+                &filmcraft_engine::transcript::sequence_laughs(s),
+                filmcraft_engine::transcript::pause_keep(s, &json!({})),
+                rate,
+            ))
+        }),
         _ => None,
     };
     let Some(r) = range else { return };
@@ -605,8 +631,9 @@ fn toolbar(app: &mut FilmcraftApp, ui: &mut egui::Ui, bar: Rect, actions: &mut V
 
 /// Quick filters under the toolbar: "Filler words (3)" and "Pauses (12)" switch the search to that
 /// filter (a second click goes back to searching text), so finding every pause is one click and
-/// shows how many there are.
-fn quick_filters(app: &mut FilmcraftApp, ui: &mut egui::Ui, row: Rect, fillers: usize, pauses: usize) {
+/// shows how many there are. With `unchecked`, "Find laughs" follows them; returns whether it was
+/// clicked.
+fn quick_filters(app: &mut FilmcraftApp, ui: &mut egui::Ui, row: Rect, fillers: usize, pauses: usize, unchecked: bool) -> bool {
     let t = app.tokens;
     let mut x = row.min.x;
     for (f, id, label) in [
@@ -634,6 +661,22 @@ fn quick_filters(app: &mut FilmcraftApp, ui: &mut egui::Ui, row: Rect, fillers: 
         }
         x = r.max.x + 6.0;
     }
+    if !unchecked {
+        return false;
+    }
+    let label = tl!("Find laughs");
+    let galley = ui.painter().layout_no_wrap(label.to_string(), Tokens::ui(12.0), t.accent);
+    let r = Rect::from_min_size(pos2(x + 6.0, row.min.y), vec2(galley.size().x + 20.0, row.height()));
+    if r.max.x > row.max.x {
+        return false;
+    }
+    let resp = ui.interact(r, egui::Id::new("transcript-find-laughs"), Sense::click());
+    let p = ui.painter();
+    p.rect_filled(r, r.height() / 2.0, if resp.hovered() { t.hover } else { t.field_bg });
+    p.rect_stroke(r, r.height() / 2.0, Stroke::new(1.0, t.accent), egui::StrokeKind::Inside);
+    p.galley(pos2(r.min.x + 10.0, r.center().y - galley.size().y / 2.0), galley, t.accent);
+    app.auto.add("text.transcript.findLaughs", r, label);
+    resp.on_hover_text(tl!("Look for laughs in the pauses, so deleting a pause keeps them (the words stay)")).clicked()
 }
 
 /// The results row: "3/33 results" with ∧ ∨ next to it; with the Pauses filter, the shortest pause
@@ -903,13 +946,19 @@ fn view_options_dialog(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     ui.label(tl!("seconds"));
                 });
             });
-            // deleting a pause leaves this much silence next to each word (a soft start or end of a
-            // word stays whole)
+            // deleting a pause leaves this much of it after the word before it (a fading end) and
+            // ahead of the word after it (a soft first consonant)
+            use filmcraft_engine::transcript::MAX_KEEP;
             ui.horizontal(|ui| {
-                ui.label(tl!("Keep next to words"));
-                use filmcraft_engine::transcript::MAX_PAUSE_HANDLE;
-                let r = ui.add(egui::DragValue::new(&mut d.pause_handle).range(0.0..=MAX_PAUSE_HANDLE).speed(0.01).max_decimals(2));
-                elems.push(("transcriptViewOptions.pauseHandle".into(), r.rect, "Keep next to words".into()));
+                ui.label(tl!("Keep after words"));
+                let r = ui.add(egui::DragValue::new(&mut d.keep_after_words).range(0.0..=MAX_KEEP).speed(0.01).max_decimals(2));
+                elems.push(("transcriptViewOptions.keepAfterWords".into(), r.rect, "Keep after words".into()));
+                ui.label(tl!("seconds"));
+            });
+            ui.horizontal(|ui| {
+                ui.label(tl!("Keep before words"));
+                let r = ui.add(egui::DragValue::new(&mut d.keep_before_words).range(0.0..=MAX_KEEP).speed(0.01).max_decimals(2));
+                elems.push(("transcriptViewOptions.keepBeforeWords".into(), r.rect, "Keep before words".into()));
                 ui.label(tl!("seconds"));
             });
             ui.add_space(6.0);
@@ -943,7 +992,7 @@ fn view_options_dialog(app: &mut FilmcraftApp, ctx: &egui::Context) {
             app.ui.transcript.view_options = None;
             let v = json!({
                 "transcript.fillerWords": d.filler_words, "transcript.pauses": d.pauses, "transcript.minPauseLength": d.min_pause_length,
-                "transcript.pauseHandle": d.pause_handle,
+                "transcript.keepAfterWords": d.keep_after_words, "transcript.keepBeforeWords": d.keep_before_words,
                 "transcript.wholeWords": d.whole_words, "transcript.matchCase": d.match_case,
             });
             if let Err(e) = app.session.execute("prefs.set", json!({"values": v})) {

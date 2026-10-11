@@ -435,10 +435,12 @@ pub struct TranscriptPrefs {
     pub pauses: bool,
     /// "Minimum pause length" (seconds): shorter silences are no pauses.
     pub min_pause_length: f64,
-    /// "Keep next to words" (seconds): deleting a pause leaves this much of its silence after the
-    /// word before it and before the word after it, so a word whose transcript edge is a little off
-    /// (a soft "s", "f" or "h" at its start, a fading end) keeps its start and its end.
-    pub pause_handle: f64,
+    /// "Keep after words" (seconds): deleting a pause leaves this much of it after the word (or
+    /// laugh) before it, so a fading end isn't cut.
+    pub keep_after_words: f64,
+    /// "Keep before words" (seconds): and this much ahead of the word (or laugh) after it, so a
+    /// soft first consonant ("s", "f", "h") a recogniser placed a little late isn't cut.
+    pub keep_before_words: f64,
     /// "Find whole words only" (otherwise the last word of a search may be the start of a word).
     pub whole_words: bool,
     /// "Match capitalization".
@@ -455,7 +457,8 @@ impl Default for TranscriptPrefs {
             filler_words: true,
             pauses: true,
             min_pause_length: crate::transcript::DEFAULT_PAUSE_SECONDS,
-            pause_handle: crate::transcript::DEFAULT_PAUSE_HANDLE,
+            keep_after_words: crate::transcript::DEFAULT_KEEP_AFTER,
+            keep_before_words: crate::transcript::DEFAULT_KEEP_BEFORE,
             whole_words: false,
             match_case: false,
             auto_scroll: true,
@@ -469,8 +472,10 @@ impl TranscriptPrefs {
         use crate::transcript::{DEFAULT_PAUSE_SECONDS, MAX_PAUSE_SECONDS, MIN_PAUSE_SECONDS};
         let v = self.min_pause_length;
         self.min_pause_length = if v.is_finite() { v.clamp(MIN_PAUSE_SECONDS, MAX_PAUSE_SECONDS) } else { DEFAULT_PAUSE_SECONDS };
-        let h = self.pause_handle;
-        self.pause_handle = if h.is_finite() { h.clamp(0.0, crate::transcript::MAX_PAUSE_HANDLE) } else { crate::transcript::DEFAULT_PAUSE_HANDLE };
+        use crate::transcript::{DEFAULT_KEEP_AFTER, DEFAULT_KEEP_BEFORE, MAX_KEEP};
+        let keep = |v: f64, d: f64| if v.is_finite() { v.clamp(0.0, MAX_KEEP) } else { d };
+        self.keep_after_words = keep(self.keep_after_words, DEFAULT_KEEP_AFTER);
+        self.keep_before_words = keep(self.keep_before_words, DEFAULT_KEEP_BEFORE);
     }
 }
 

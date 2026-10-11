@@ -14,6 +14,12 @@
 //! reuse the ordinary [`crate::extract`] / [`crate::lift`] edits. Pause and filler-word removal
 //! ([`find_pauses`], [`find_fillers`]) produce many ranges that [`ripple_delete_ranges`] removes in
 //! one pass, right to left. Captions come from [`caption_blocks`].
+//!
+//! A pause is the time between two words. Deleting it ([`pause_cuts`]) leaves a little of it next
+//! to the sound on each side ([`Keep`]: after a word's fading end, ahead of a soft first consonant)
+//! and keeps a laugh in it ([`sequence_laughs`], found in the audio by `filmcraft_speech::laugh`):
+//! the silence before and after the laugh goes, the laugh stays. A cough or a breath goes with the
+//! pause.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -213,23 +219,89 @@ pub fn pauses(words: &[SeqWord], min: Tick) -> Vec<Pause> {
     (0..words.len().saturating_sub(1)).filter_map(|i| pause_after(words, i)).filter(|p| p.duration() >= min).collect()
 }
 
-/// The timeline range removing pause `p` except `keep` of silence next to both words, snapped
-/// inward to frames; None when less than a frame is left.
-pub fn pause_range(p: &Pause, keep: Tick, rate: FrameRate) -> Option<TimeRange> {
-    let (s, e) = (p.start + keep, p.end - keep);
-    let mut s2 = rate.snap(s);
-    if s2 < s {
-        s2 += rate.frame_duration();
-    }
-    let e2 = rate.snap(e);
-    (e2 > s2).then(|| TimeRange::from_bounds(s2, e2))
+/// What a deleted pause leaves of itself next to the sound on each side: `after` past the word (or
+/// laugh) before it, for a fading end, and `before` ahead of the word (or laugh) after it, for a
+/// soft first consonant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Keep {
+    pub after: Tick,
+    pub before: Tick,
 }
 
-/// Pauses between consecutive words of at least `min`, as the ranges to remove: each keeps `keep`
-/// of silence next to both words and is snapped inward to frames (pauses shorter than one frame
-/// after that are skipped).
-pub fn find_pauses(words: &[SeqWord], min: Tick, keep: Tick, rate: FrameRate) -> Vec<TimeRange> {
-    pauses(words, min).iter().filter_map(|p| pause_range(p, keep, rate)).collect()
+impl Keep {
+    /// The same on both sides.
+    pub fn both(t: Tick) -> Self {
+        Keep { after: t, before: t }
+    }
+}
+
+/// The laughs of the sequence transcript in sequence time: each transcript's laughs mapped through
+/// the audio clips that play it, as words are ([`sequence_words`]: top track first, clamped to the
+/// clip), in order and merged.
+pub fn sequence_laughs(seq: &Sequence, transcripts: &Transcripts) -> Vec<TimeRange> {
+    let mut out = Vec::new();
+    let mut claimed: Vec<TimeRange> = Vec::new();
+    for track in &seq.audio_tracks {
+        let mut mine = Vec::new();
+        for it in &track.items {
+            if !it.enabled || it.reverse || it.frame_hold.is_some() || it.speed <= 0.0 {
+                continue;
+            }
+            let Some(tr) = transcripts.get(&it.item) else { continue };
+            mine.push(it.range());
+            let speed = it.speed;
+            let to_tl = |m: Tick| it.start + ticks((m - it.source_in).0 as f64 / speed);
+            for l in tr.laughs.iter().flatten() {
+                let (a, b) = (to_tl(l.start).max(it.start), to_tl(l.end()).min(it.end()));
+                let mid = Tick(a.0 + (b.0 - a.0) / 2);
+                if b > a && !claimed.iter().any(|r| r.contains(mid)) {
+                    out.push(TimeRange::from_bounds(a, b));
+                }
+            }
+        }
+        claimed.extend(mine);
+    }
+    merge_ranges(out)
+}
+
+/// The laughs (sorted, as [`sequence_laughs`] gives them) inside pause `p`, clamped to it.
+pub fn pause_laughs(p: &Pause, laughs: &[TimeRange]) -> Vec<TimeRange> {
+    laughs.iter().filter(|l| l.start < p.end && l.end() > p.start).map(|l| TimeRange::from_bounds(l.start.max(p.start), l.end().min(p.end))).collect()
+}
+
+/// The timeline ranges that remove pause `p`: the silence between the sounds around and in it
+/// (the word before, each laugh in it, the word after), less `keep` next to each sound, snapped
+/// inward to frames. A laugh stays; pieces shorter than a frame are left. Empty when nothing is
+/// left to remove.
+pub fn pause_cuts(p: &Pause, laughs: &[TimeRange], keep: Keep, rate: FrameRate) -> Vec<TimeRange> {
+    let fd = rate.frame_duration();
+    let inward = |s: Tick, e: Tick| {
+        let mut s2 = rate.snap(s);
+        if s2 < s {
+            s2 += fd;
+        }
+        let e2 = rate.snap(e);
+        (e2 > s2).then(|| TimeRange::from_bounds(s2, e2))
+    };
+    let mut out = Vec::new();
+    // the end of the sound before the piece
+    let mut from = p.start;
+    for next in pause_laughs(p, laughs).into_iter().chain(std::iter::once(TimeRange::from_bounds(p.end, p.end))) {
+        out.extend(inward(from + keep.after, next.start - keep.before));
+        from = from.max(next.end());
+    }
+    out
+}
+
+/// The span of a pause's cuts (from the first one's start to the last one's end): where In/Out go
+/// when the pause is selected.
+pub fn cuts_extent(cuts: &[TimeRange]) -> Option<TimeRange> {
+    Some(TimeRange::from_bounds(cuts.first()?.start, cuts.last()?.end()))
+}
+
+/// Pauses between consecutive words of at least `min`, as the ranges to remove ([`pause_cuts`]).
+pub fn find_pauses(words: &[SeqWord], laughs: &[TimeRange], min: Tick, keep: Keep, rate: FrameRate) -> Vec<TimeRange> {
+    pauses(words, min).iter().flat_map(|p| pause_cuts(p, laughs, keep, rate)).collect()
 }
 
 /// The filler words of English transcripts (and of transcripts without a language).

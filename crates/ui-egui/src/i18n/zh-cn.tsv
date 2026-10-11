@@ -3507,7 +3507,13 @@
 	Licence: {license}	许可证：{license}
 	Loading speech model…	正在加载语音模型…
 	Match capitalization	区分大小写
-	Keep next to words	在词语旁保留
+	Keep after words	词语后保留
+	Keep before words	词语前保留
+	laugh	笑声
+	The laugh in it stays when the pause is deleted	删除停顿时，其中的笑声会保留
+	Find laughs	查找笑声
+	Look for laughs in the pauses, so deleting a pause keeps them (the words stay)	查找停顿中的笑声，删除停顿时保留它们（词语不变）
+	Find Laughs in Pauses	查找停顿中的笑声
 	Minimum pause length	最短停顿时长
 	More options	更多选项
 	Next result	下一个结果

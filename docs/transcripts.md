@@ -19,7 +19,9 @@ Extract and Lift for the text selection, and "•••".
 
 **Quick filters** (FilmCraft): under the toolbar, "Filler words (2)" and "Pauses (12)" turn that
 filter on in one click (again: back to text) and say how many there are before anything is
-searched. Premiere has only the filter menu.
+searched. Premiere has only the filter menu. After them, "Find laughs" shows while a transcript in
+the sequence was never looked at for laughs (see *A laugh in a pause stays* below); a click looks
+in the background and keeps the words.
 
 | Where | Premiere | FilmCraft |
 |---|---|---|
@@ -28,7 +30,7 @@ searched. Premiere has only the filter menu.
 | Delete row | opened by the results row's Delete: radios "Extract" (default) / "Lift"; buttons "Delete all", "Delete" | always shown while searching, no Delete button to open it: "Delete all pauses (12)" (or "filler words", or matches) first, then "Delete", "Extract" / "Lift"; each button is one undo step |
 | Matches | all orange, the current one salmon | the same |
 | "•••" menu | ACTIONS: "Create captions…", "Transcribe sequence", "Generate static transcript…", "Export ›", "Import ›"; PREFERENCES: "Transcript view options…", "Enable auto-scrolling" ✓, "Spell check ›" | "Create captions", "Transcribe sequence…"; "Transcript view options…", "Enable auto-scrolling" ✓ |
-| Transcript view options | "Filler words", "Markers", "Low-confidence words", "Untranscribed sources", "Speakers", "Pauses", "Minimum pause length" (slider + "seconds"); Search settings "Find whole words only", "Match capitalization"; "Cancel" / "Save" | "Filler words" ✓, "Pauses" ✓, "Minimum pause length" 0.1–3.0 s, default **0.75 s**; FilmCraft's "Keep next to words" 0–1 s, default **0.15 s** (see below); both search settings (off) |
+| Transcript view options | "Filler words", "Markers", "Low-confidence words", "Untranscribed sources", "Speakers", "Pauses", "Minimum pause length" (slider + "seconds"); Search settings "Find whole words only", "Match capitalization"; "Cancel" / "Save" | "Filler words" ✓, "Pauses" ✓, "Minimum pause length" 0.1–3.0 s, default **0.75 s**; FilmCraft's "Keep after words" and "Keep before words" 0–1 s, defaults **0.05 s** and **0.08 s** (see below); both search settings (off) |
 
 **Transcribing.** The empty tab says "Transcribe source clips" / "Transcribe your source clips to
 view your sequence transcript." with a **Transcribe** button. When some audio clips have no
@@ -58,14 +60,23 @@ text ("00:00:02:22 - 00:00:05:08"); the speaker column is hidden while speakers 
   Dragging over words or Shift+click selects text; with "{ }" on that marks In/Out on the timeline.
   A double-click selects one word.
 - Pauses of at least the minimum pause length show inline as a dimmed "[...]", pauses of 1 s or
-  more with their length ("[... 2.4 s]") so long ones stand out; hovering shows the length
-  ("1.2 seconds"); a click selects the pause.
+  more with their length ("[... 2.4 s]") so long ones stand out, and one with a laugh in it says
+  so ("[... 1.9 s · laugh]"); hovering shows the length ("1.2 seconds"); a click selects the pause.
 - Filler words are marked (tinted, dimmed) when "Filler words" is on.
-- **Deleting a pause keeps a little of it next to the words** (FilmCraft): 0.15 s after the word
-  before it and 0.15 s before the word after it (Transcript view options ▸ Keep next to words).
-  Speech recognition puts a word's edge a few tens of milliseconds off, more on a soft first sound;
-  cutting right up to it took the start off words. A 1.2 s pause becomes about 0.3 s; one too short
-  to leave that much is not deleted.
+- **Deleting a pause cuts close to the words** (FilmCraft): it keeps 0.05 s after the word before
+  it (Transcript view options ▸ Keep after words), so the cut follows where the sound stops, and
+  0.08 s before the word after it (Keep before words): speech recognition can place a soft first
+  sound ("s", "f", "h") a few tens of milliseconds late, and cutting right up to it took the start
+  off words. A 1.2 s pause becomes about 0.15 s; one too short to leave that much is not deleted.
+- **A laugh in a pause stays** (FilmCraft): when a clip is transcribed, FilmCraft looks at the
+  sound in the pauses between its words (`filmcraft_speech::laugh`). A laugh is voiced (the voice
+  sounds, as on a vowel) and comes in pulses ("ha-ha-ha", 100–400 ms apart); a cough, clearing
+  the throat, a breath or a click is not, and goes with the pause. Deleting a pause with a laugh in
+  it cuts the silence before and after the laugh (keeping the same 0.05 s after each sound and
+  0.08 s ahead of each) and the laugh plays whole. A single "ha" or "hm" counts as no laugh.
+  Transcripts made before this, or brought with `transcript.set` without `laughs`, were never
+  looked at: their pauses are cut whole until "Find laughs" (or `transcript.findLaughs`) looks;
+  transcribing again does too.
 - Delete or Backspace with text or a pause selected **extracts** it (ripple delete, gaps close);
   Alt+Backspace **lifts** it (leaves a gap). Ctrl/Cmd+F goes to the search field; ← → ↑ ↓,
   Home / End (with Shift to extend) move the playhead word by word as in Premiere.
@@ -100,16 +111,17 @@ to Out point only", the source-clip transcript in the Source monitor, and "Follo
 | `transcript.generate` | Transcribe media items (`items`, else the Project selection, else the media of the sequence's audio clips). Params: `model` (default: Settings ▸ Speech model, `parakeet-tdt-0.6b-v3`; also `parakeet-tdt-0.6b-v2`, `whisper-tiny`/`-base`/`-small`/`-large-v3-turbo`/`-large-v3`), `language` (`auto` = detect), `diarize`, `maxSpeakers`, `download` (fetch a missing model first; otherwise a missing model is an error naming its size and licence), `wait` (default `true`: return when done with the per-item report; `false`: start a background job and return `{job, items, running}`). One undo step ("Transcribe") when it finishes; a cancelled or failed job changes nothing. |
 | `transcript.status` / `transcript.cancel` | The running transcription (`progress` 0–1, `status`, `etaSeconds`, `items`) or `{"running": false}` / stop it (`jobs.list` and `jobs.cancel` see the same job, label "Transcription"). |
 | `sequence.transcribe` | Sequence ▸ Transcribe Sequence…: `transcript.generate` on the audio of `track` — `mix` (every audio track), `dialogue` (clips with the Essential Sound type Dialogue) or one track (`A1`) — with the same `language`, `model`, `download` and `wait`. |
-| `transcript.set` | Store a transcript you bring (JSON: `language`, `speakers`, `words` with `text`/`start`/`end`/`speaker`); it is sorted and made well formed. |
+| `transcript.set` | Store a transcript you bring (JSON: `language`, `speakers`, `words` with `text`/`start`/`end`/`speaker`, optionally `laughs` as `{start, duration}` media-time ranges); it is sorted and made well formed. |
+| `transcript.findLaughs` | Look for laughs in the pauses of transcribed items (`items` chosen as for `transcript.generate`, of them the transcribed ones; `audioStreams`, default the one the sequence plays), so deleting a pause keeps them; the words stay. Decodes only, nothing is recognised. `wait` as `transcript.generate`; one undo step ("Find Laughs"); returns per item the number of `laughs`. |
 | `transcript.delete` | Remove transcripts. |
-| `transcript.inspect` | The sequence transcript: words (index, text, sequence times, speaker, clip, `filler`), paragraphs, `pauses` (`after`, `start`, `end`, `seconds`; at least `minPauseSeconds`, default Transcript view options ▸ Minimum pause length), speakers, the word (`current`) or pause (`currentPause`) at the playhead. |
-| `transcript.search` | Matches of a search: `filter` `text` (a phrase in `query`; punctuation ignored; the last word may be a prefix unless `wholeWords`; case ignored unless `matchCase`; both default to Search settings), `fillers` (word ranges) or `pauses` (`pauseAfter`). Returns `count` and `matches`. |
-| `transcript.deleteAll` | Remove every match of a search (same params) in one undo step: Extract (ripple, default) or `lift: true`. A pause goes less `keepSeconds` of its silence next to each word (default Transcript view options ▸ Keep next to words, 0.15 s); `keepSeconds: 0` removes the whole silence. |
-| `transcript.select` | Mark In/Out around words `from..=to` (frame-snapped outward) or the pause `pauseAfter` (less `keepSeconds` next to the words, frame-snapped inward) and move the playhead there. |
-| `transcript.extract` / `transcript.lift` | Extract (ripple) or lift the words' (or the pause's) frames on the targeted tracks. |
+| `transcript.inspect` | The sequence transcript: words (index, text, sequence times, speaker, clip, `filler`), paragraphs, `pauses` (`after`, `start`, `end`, `seconds`, `laughs` when one is in it; at least `minPauseSeconds`, default Transcript view options ▸ Minimum pause length), `laughs` (sequence time), `laughsChecked` (every transcript was looked at for laughs), speakers, the word (`current`) or pause (`currentPause`) at the playhead. |
+| `transcript.search` | Matches of a search: `filter` `text` (a phrase in `query`; punctuation ignored; the last word may be a prefix unless `wholeWords`; case ignored unless `matchCase`; both default to Search settings), `fillers` (word ranges) or `pauses` (`pauseAfter`, `laughs`). Returns `count` and `matches`. |
+| `transcript.deleteAll` | Remove every match of a search (same params) in one undo step: Extract (ripple, default) or `lift: true`. A pause goes less `keepAfterSeconds` after the sound before it and `keepBeforeSeconds` ahead of the sound after it (defaults Transcript view options ▸ Keep after words, 0.05 s, and Keep before words, 0.08 s; `keepSeconds` sets both; 0 removes the whole gap); a laugh in it stays. |
+| `transcript.select` | Mark In/Out around words `from..=to` (frame-snapped outward) or the pause `pauseAfter` (less what is kept next to the words, as `transcript.deleteAll`, frame-snapped inward) and move the playhead there. |
+| `transcript.extract` / `transcript.lift` | Extract (ripple) or lift the words' (or the pause's) frames on the targeted tracks; a pause with a laugh in it is cut before and after the laugh (`ranges`). |
 | `transcript.renameSpeaker` | Rename a speaker by name (every transcript) or by index in one `item`. |
 | `transcript.removeFillers` | Ripple-delete filler words (`fillers`, default the list of each transcript's language, see Premiere parity; phrases such as "you know" allowed). |
-| `transcript.removePauses` | Ripple-delete pauses longer than `minSeconds`, keeping `keepSeconds` of air on both sides (default Keep next to words). |
+| `transcript.removePauses` | Ripple-delete pauses longer than `minSeconds`, keeping what `transcript.deleteAll` keeps next to the words; a laugh in a pause stays. |
 | `transcript.createCaptions` | Lay the words out as captions on a new caption track (`maxChars`, `lines`, `minSeconds`, `maxSeconds`, `gapFrames`). |
 | `transcript.models` / `transcript.downloadModel` | List the speech models (size, licence, licence URL, attribution line, installed) / download one. |
 
@@ -233,8 +245,9 @@ the local speech samples (LibriSpeech read speech and dialogue clips) (about 9.5
 Apple-silicon laptop CPU).
 
 Transcript view options and the panel's toggles are preferences (`prefs.set`): `transcript.fillerWords`,
-`transcript.pauses`, `transcript.minPauseLength` (0.1–3.0 s, default 0.75), `transcript.pauseHandle`
-(Keep next to words, 0–1 s, default 0.15), `transcript.wholeWords`,
+`transcript.pauses`, `transcript.minPauseLength` (0.1–3.0 s, default 0.75), `transcript.keepAfterWords`
+(Keep after words, 0–1 s, default 0.05), `transcript.keepBeforeWords` (Keep before words, 0–1 s,
+default 0.08), `transcript.wholeWords`,
 `transcript.matchCase`, `transcript.autoScroll`, `transcript.autoInOut`.
 
 ### Background jobs and the recogniser

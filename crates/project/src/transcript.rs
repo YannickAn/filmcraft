@@ -73,6 +73,11 @@ pub struct Transcript {
     pub speakers: Vec<Speaker>,
     /// Words in time order, non-overlapping.
     pub words: Vec<Word>,
+    /// Laughs in the pauses between words, in media time (`filmcraft_speech::laugh`): deleting a
+    /// pause keeps them. `None` when the audio was never looked at for laughs (a transcript made
+    /// before FilmCraft did, or one brought in): its pauses are cut whole.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub laughs: Option<Vec<TimeRange>>,
 }
 
 impl Transcript {
@@ -113,6 +118,19 @@ impl Transcript {
             if self.words[i - 1].end > s {
                 self.words[i - 1].end = s.max(self.words[i - 1].start);
             }
+        }
+        // laughs: sorted, empty ones dropped, overlaps merged
+        if let Some(l) = self.laughs.as_mut() {
+            l.retain(|r| r.duration > Tick::ZERO);
+            l.sort_by_key(|r| r.start);
+            let mut merged: Vec<TimeRange> = Vec::with_capacity(l.len());
+            for r in l.drain(..) {
+                match merged.last_mut() {
+                    Some(m) if r.start <= m.end() => *m = TimeRange::from_bounds(m.start, m.end().max(r.end())),
+                    _ => merged.push(r),
+                }
+            }
+            *l = merged;
         }
         let max = self.words.iter().filter_map(|w| w.speaker).max();
         if let Some(m) = max {
@@ -171,5 +189,21 @@ mod tests {
         assert_eq!(t.words[0].normalized(), "um");
         assert_eq!(t.words[1].normalized(), "don't");
         assert_eq!(t.text(), "Um, Don't! go");
+    }
+
+    #[test]
+    fn normalize_merges_laughs_and_old_transcripts_have_none() {
+        let r = |a: i64, b: i64| TimeRange::from_bounds(Tick(a), Tick(b));
+        let mut t = Transcript { laughs: Some(vec![r(50, 60), r(0, 10), r(5, 20), r(30, 30)]), ..Default::default() };
+        t.normalize();
+        assert_eq!(t.laughs, Some(vec![r(0, 20), r(50, 60)]));
+        // a transcript saved before laughs were looked for reads as unknown, and stays unwritten
+        let old: Transcript = serde_json::from_str(r#"{"language":"en","source":"x","speakers":[],"words":[]}"#).unwrap();
+        assert_eq!(old.laughs, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("laughs"));
+        // one looked at and without laughs says so
+        let none = Transcript { laughs: Some(Vec::new()), ..Default::default() };
+        let back: Transcript = serde_json::from_str(&serde_json::to_string(&none).unwrap()).unwrap();
+        assert_eq!(back.laughs, Some(Vec::new()));
     }
 }

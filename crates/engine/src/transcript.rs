@@ -133,7 +133,14 @@ const DECODE_CHUNK_SECONDS: usize = 30;
 #[derive(Clone)]
 enum Recogniser {
     Installed(Arc<dyn Transcriber>),
-    Model { model: &'static filmcraft_speech::models::ModelInfo, dir: std::path::PathBuf, download: bool },
+    Model {
+        model: &'static filmcraft_speech::models::ModelInfo,
+        dir: std::path::PathBuf,
+        download: bool,
+    },
+    /// `transcript.findLaughs`: no recognition; these transcripts keep their words and get the
+    /// laughs in their pauses.
+    FindLaughs(BTreeMap<ItemId, Arc<Transcript>>),
 }
 
 /// The recogniser for `transcript.generate`: the installed one, else the named catalogue model
@@ -186,6 +193,8 @@ pub struct Transcribed {
 /// it finishes. A cancelled job changes nothing.
 pub struct PendingTranscription {
     pub job: u64,
+    /// The undo step it makes ("Transcribe", "Find Laughs").
+    pub label: &'static str,
     pub items: Vec<ItemId>,
     /// The items' names when the job started: a transcript is only applied to the item it was
     /// made for (not to another project's item with the same id, opened meanwhile).
@@ -245,6 +254,31 @@ fn decode(w: &WorkItem, prog: &filmcraft_export::Progress, status: &str, base: f
     Ok(Some(out))
 }
 
+/// The body of a `transcript.findLaughs` job: decode each item and find the laughs in the pauses
+/// of its transcript ([`filmcraft_speech::laugh::laughs`]), which keeps its words. `Ok(None)`:
+/// cancelled.
+fn find_laughs_items(
+    existing: &BTreeMap<ItemId, Arc<Transcript>>,
+    work: &[WorkItem],
+    prog: &filmcraft_export::Progress,
+) -> std::result::Result<Option<Vec<(ItemId, Transcript)>>, String> {
+    let total: f64 = work.iter().map(|w| w.samples as f64).sum::<f64>().max(1.0);
+    let mut base = 0.0;
+    let mut out = Vec::new();
+    for w in work {
+        let share = w.samples as f64 / total;
+        let status = format!("Looking for laughs in {}", w.name);
+        let Some(audio) = decode(w, prog, &status, base, share)? else { return Ok(None) };
+        base += share;
+        let Some(t) = existing.get(&w.item) else { continue };
+        let mut t = (**t).clone();
+        t.laughs = Some(filmcraft_speech::laugh::laughs(&audio, &t.words));
+        t.normalize();
+        out.push((w.item, t));
+    }
+    Ok(Some(out))
+}
+
 /// The body of a transcription job: get the recogniser (download, load), then decode and
 /// transcribe each item. `Ok(None)`: cancelled.
 fn transcribe_items(
@@ -254,6 +288,7 @@ fn transcribe_items(
     prog: &filmcraft_export::Progress,
 ) -> std::result::Result<Option<Vec<(ItemId, Transcript)>>, String> {
     let t = match rec {
+        Recogniser::FindLaughs(existing) => return find_laughs_items(&existing, work, prog),
         Recogniser::Installed(t) => t,
         Recogniser::Model { model, dir, download } => {
             if !filmcraft_speech::models::installed(&dir, model) {
@@ -300,14 +335,44 @@ fn transcribe_items(
 }
 
 fn generate(s: &mut Session, p: &Value) -> Result<Value> {
-    let items = targets(s, p);
+    start(s, p, false)
+}
+
+/// `transcript.findLaughs`: find the laughs in the pauses of transcripts made before FilmCraft
+/// looked for them, so deleting a pause keeps the laugh; the words stay. Much quicker than
+/// transcribing again: the audio is decoded, nothing is recognised.
+fn find_laughs(s: &mut Session, p: &Value) -> Result<Value> {
+    start(s, p, true)
+}
+
+/// The audio stream a sequence plays of `item`: the first enabled audio clip of it, top track
+/// first.
+fn played_stream(s: &Session, item: ItemId) -> Option<usize> {
+    let q = s.active_sequence()?;
+    q.audio_tracks.iter().flat_map(|t| t.items.iter()).find(|it| it.item == item && it.enabled).map(|it| it.audio_stream)
+}
+
+/// Start a transcription job (`laughs`: a `transcript.findLaughs` job).
+fn start(s: &mut Session, p: &Value, laughs: bool) -> Result<Value> {
+    let cmd = if laughs { "transcript.findLaughs" } else { "transcript.generate" };
+    let mut items = targets(s, p);
+    if laughs {
+        items.retain(|i| s.project.transcripts.contains_key(i));
+        if items.is_empty() {
+            return Err(bad(cmd, "nothing to look at: none of the clips is transcribed"));
+        }
+    }
     if items.is_empty() {
-        return Err(bad("transcript.generate", "nothing to transcribe (pass `items`, select clips, or open a sequence with audio)"));
+        return Err(bad(cmd, "nothing to transcribe (pass `items`, select clips, or open a sequence with audio)"));
     }
     if running_job(s).is_some() {
         return Err(EngineError::Other("a transcription is already running (transcript.cancel stops it)".into()));
     }
-    let rec = recogniser(s, p)?;
+    let rec = if laughs {
+        Recogniser::FindLaughs(items.iter().filter_map(|i| Some((*i, s.project.transcripts.get(i)?.clone()))).collect())
+    } else {
+        recogniser(s, p)?
+    };
     // Settings ▸ Media Analysis & Transcription: language (or auto-detect) and speaker labelling
     let ma = &s.prefs.media_analysis;
     let default_language = if ma.language_auto_detect { None } else { Some(ma.default_language.clone()) };
@@ -331,7 +396,9 @@ fn generate(s: &mut Session, p: &Value) -> Result<Value> {
             }
         };
         // `audioStreams` {item: stream}: which audio stream of a multi-stream recording to listen to
-        let stream = p.get("audioStreams").and_then(|m| m.get(item.0.to_string())).and_then(Value::as_u64).map_or(0, |n| n as usize);
+        // (looking for laughs: the one the sequence plays, unless named)
+        let named = p.get("audioStreams").and_then(|m| m.get(item.0.to_string())).and_then(Value::as_u64).map(|n| n as usize);
+        let stream = named.or_else(|| if laughs { played_stream(s, item) } else { None }).unwrap_or(0);
         let (Some(src), Some(name)) = (s.source(item).filter(|src| src.info().audio_streams.len() > stream), s.project.item(item).map(|i| i.name.clone()))
         else {
             skipped.push(item);
@@ -345,7 +412,7 @@ fn generate(s: &mut Session, p: &Value) -> Result<Value> {
         work.push(WorkItem { item, name, src, stream, samples: samples as usize });
     }
     if work.is_empty() {
-        return Err(EngineError::Other("none of the clips has audio to transcribe".into()));
+        return Err(EngineError::Other(format!("none of the clips has audio to {}", if laughs { "look at" } else { "transcribe" })));
     }
     let ids: Vec<ItemId> = work.iter().map(|w| w.item).collect();
     let names: Vec<String> = work.iter().map(|w| w.name.clone()).collect();
@@ -362,7 +429,9 @@ fn generate(s: &mut Session, p: &Value) -> Result<Value> {
         let r = match r {
             Ok(Some(transcripts)) => {
                 let words: usize = transcripts.iter().map(|(_, t)| t.words.len()).sum();
-                report(&prog, format!("Transcribed {words} word(s) ({secs:.1}s)"), 1.0);
+                let found: usize = transcripts.iter().map(|(_, t)| t.laughs.as_ref().map_or(0, Vec::len)).sum();
+                let done = if laughs { format!("Found {found} laugh(s) ({secs:.1}s)") } else { format!("Transcribed {words} word(s) ({secs:.1}s)") };
+                report(&prog, done, 1.0);
                 *lock(&out) = Some(Transcribed { transcripts, skipped: skipped_items });
                 Ok(filmcraft_export::Report { path: String::new(), frames: words as u64, seconds: secs, bytes: 0, render_fps: 0.0, extra_files: Vec::new() })
             }
@@ -381,7 +450,13 @@ fn generate(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let run = crate::export_tools::guard_job(job.progress.clone(), job.result.clone(), run);
     s.jobs.push(job);
-    s.transcribe_jobs.push(PendingTranscription { job: id, items: ids.clone(), names, results: results.clone() });
+    s.transcribe_jobs.push(PendingTranscription {
+        job: id,
+        label: if laughs { "Find Laughs" } else { "Transcribe" },
+        items: ids.clone(),
+        names,
+        results: results.clone(),
+    });
     let wait = bool_p(p, "wait").unwrap_or(true);
     if !(wait || cfg!(target_arch = "wasm32")) {
         std::thread::Builder::new().name("filmcraft-transcribe".into()).spawn(run).map_err(|e| EngineError::Other(e.to_string()))?;
@@ -399,7 +474,10 @@ fn generate(s: &mut Session, p: &Value) -> Result<Value> {
     let items: Vec<Value> = done
         .transcripts
         .iter()
-        .map(|(i, t)| json!({"item": i.0, "words": t.words.len(), "speakers": t.speakers.len(), "language": t.language, "source": t.source}))
+        .map(|(i, t)| {
+            json!({"item": i.0, "words": t.words.len(), "speakers": t.speakers.len(), "language": t.language, "source": t.source,
+                "laughs": t.laughs.as_ref().map(Vec::len)})
+        })
         .collect();
     Ok(json!({"job": id, "items": items, "skipped": skipped.iter().map(|i| i.0).collect::<Vec<_>>()}))
 }
@@ -440,13 +518,18 @@ pub fn poll(s: &mut Session) {
             continue;
         }
         let words: usize = transcripts.iter().map(|(_, t)| t.words.len()).sum();
-        let r = s.edit("Transcribe", move |pr, _| {
+        let laughs: usize = transcripts.iter().map(|(_, t)| t.laughs.as_ref().map_or(0, Vec::len)).sum();
+        let looked_for_laughs = pending.label == "Find Laughs";
+        let r = s.edit(pending.label, move |pr, _| {
             for (i, t) in transcripts {
                 pr.transcripts.insert(i, Arc::new(t));
             }
             Ok(())
         });
         match r {
+            Ok(()) if looked_for_laughs => {
+                s.events.push(crate::Event::Toast { message: format!("Laughs found: {laughs}. Deleting a pause keeps the laugh in it"), error: false })
+            }
             Ok(()) if words == 0 => s.toast("Transcription finished: no speech was found"),
             Ok(()) => s.events.push(crate::Event::Toast { message: format!("Transcription finished: {words} word(s)"), error: false }),
             Err(e) => s.error_toast("transcript.generate", format!("Transcription: {e}")),
@@ -524,18 +607,44 @@ pub const DEFAULT_PAUSE_SECONDS: f64 = 0.75;
 pub const MIN_PAUSE_SECONDS: f64 = 0.1;
 pub const MAX_PAUSE_SECONDS: f64 = 3.0;
 
-/// Transcript view options ▸ Keep next to words: the silence a deleted pause leaves next to each
-/// word, default and maximum, in seconds. Word edges from speech recognition can be a few tens of
-/// milliseconds late (more on a soft "s", "f" or "h"); cutting a pause right up to them took the
-/// start off words.
-pub const DEFAULT_PAUSE_HANDLE: f64 = 0.15;
-pub const MAX_PAUSE_HANDLE: f64 = 1.0;
+/// Transcript view options ▸ Keep after words / Keep before words: what a deleted pause leaves of
+/// itself after the word (or laugh) before it and ahead of the word (or laugh) after it, defaults
+/// and maximum, in seconds. Little after a word, so the cut follows where its sound stops; a bit
+/// more ahead of the next one, whose soft first consonant ("s", "f", "h") a recogniser can place a
+/// few tens of milliseconds late (cutting right up to it took the start off words).
+pub const DEFAULT_KEEP_AFTER: f64 = 0.05;
+pub const DEFAULT_KEEP_BEFORE: f64 = 0.08;
+pub const MAX_KEEP: f64 = 1.0;
 
-/// The silence a deleted pause leaves next to each word: `keepSeconds`, else Transcript view
-/// options ▸ Keep next to words (`transcript.pauseHandle`).
-pub fn pause_handle(s: &Session, p: &Value) -> Tick {
-    let secs = f64_p(p, "keepSeconds").unwrap_or(s.prefs.transcript.pause_handle);
-    Tick::from_seconds_f64(if secs.is_finite() { secs.clamp(0.0, MAX_PAUSE_HANDLE) } else { DEFAULT_PAUSE_HANDLE })
+/// A keep length in seconds as ticks: clamped to 0–[`MAX_KEEP`], `default` when not a number.
+fn keep_ticks(secs: f64, default: f64) -> Tick {
+    Tick::from_seconds_f64(if secs.is_finite() { secs.clamp(0.0, MAX_KEEP) } else { default })
+}
+
+/// What a deleted pause leaves next to the sound around it: `keepAfterSeconds` /
+/// `keepBeforeSeconds`, else `keepSeconds` for both, else Transcript view options ▸ Keep after
+/// words / Keep before words (`transcript.keepAfterWords`, `transcript.keepBeforeWords`).
+pub fn pause_keep(s: &Session, p: &Value) -> tx::Keep {
+    let t = &s.prefs.transcript;
+    let both = f64_p(p, "keepSeconds");
+    tx::Keep {
+        after: keep_ticks(f64_p(p, "keepAfterSeconds").or(both).unwrap_or(t.keep_after_words), DEFAULT_KEEP_AFTER),
+        before: keep_ticks(f64_p(p, "keepBeforeSeconds").or(both).unwrap_or(t.keep_before_words), DEFAULT_KEEP_BEFORE),
+    }
+}
+
+/// The laughs of the active sequence's transcript, in sequence time ([`tx::sequence_laughs`]).
+pub fn sequence_laughs(s: &Session) -> Vec<TimeRange> {
+    match s.active_sequence() {
+        Some(q) => tx::sequence_laughs(q, &s.project.transcripts),
+        None => Vec::new(),
+    }
+}
+
+/// Whether every transcript the sequence transcript reads from was looked at for laughs (false:
+/// some pauses would be cut whole, laugh or not; `transcript.findLaughs` looks).
+pub fn laughs_checked(s: &Session, words: &[SeqWord]) -> bool {
+    words.iter().all(|w| s.project.transcripts.get(&w.item).is_none_or(|t| t.laughs.is_some()))
 }
 
 /// The shortest silence shown and found as a pause: `minPauseSeconds`, else Transcript view
@@ -570,8 +679,13 @@ fn filler_flags(n: usize, hits: &[std::ops::Range<usize>]) -> Vec<bool> {
     f
 }
 
-fn pause_json(p: &tx::Pause) -> Value {
-    json!({"after": p.after, "start": p.start.0, "end": p.end.0, "seconds": p.duration().seconds()})
+fn pause_json(p: &tx::Pause, laughs: &[TimeRange]) -> Value {
+    let mut v = json!({"after": p.after, "start": p.start.0, "end": p.end.0, "seconds": p.duration().seconds()});
+    let inside = tx::pause_laughs(p, laughs);
+    if let (false, Some(o)) = (inside.is_empty(), v.as_object_mut()) {
+        o.insert("laughs".into(), inside.iter().map(|r| range_json(*r)).collect());
+    }
+    v
 }
 
 fn inspect(s: &mut Session, p: &Value) -> Result<Value> {
@@ -600,16 +714,19 @@ fn inspect(s: &mut Session, p: &Value) -> Result<Value> {
     let current = tx::word_at(&words, ph);
     let min = min_pause(s, p);
     let pauses = tx::pauses(&words, min);
+    let laughs = sequence_laughs(s);
     let fillers = filler_flags(words.len(), &filler_hits(s, &words, p));
     Ok(json!({
         "words": words.iter().enumerate().map(|(i, w)| word_json(i, w, fillers.get(i).copied().unwrap_or(false))).collect::<Vec<_>>(),
         "paragraphs": paras,
-        "pauses": pauses.iter().map(pause_json).collect::<Vec<_>>(),
+        "pauses": pauses.iter().map(|q| pause_json(q, &laughs)).collect::<Vec<_>>(),
         "minPauseSeconds": min.seconds(),
+        "laughs": laughs.iter().map(|r| range_json(*r)).collect::<Vec<_>>(),
+        "laughsChecked": laughs_checked(s, &words),
         "speakers": speakers,
         "current": current,
         "currentPause": pauses.iter().find(|q| q.start <= ph && ph < q.end).map(|q| q.after),
-        "items": s.project.transcripts.iter().map(|(i, t)| json!({"item": i.0, "words": t.words.len(), "language": t.language, "source": t.source, "speakers": t.speakers.iter().map(|k| &k.name).collect::<Vec<_>>()})).collect::<Vec<_>>(),
+        "items": s.project.transcripts.iter().map(|(i, t)| json!({"item": i.0, "words": t.words.len(), "language": t.language, "source": t.source, "speakers": t.speakers.iter().map(|k| &k.name).collect::<Vec<_>>(), "laughs": t.laughs.as_ref().map(Vec::len)})).collect::<Vec<_>>(),
     }))
 }
 
@@ -680,13 +797,20 @@ pub fn matches(s: &Session, words: &[SeqWord], filter: Filter, query: &str, p: &
     }
 }
 
-fn match_json(words: &[SeqWord], m: &Match) -> Value {
+fn match_json(words: &[SeqWord], laughs: &[TimeRange], m: &Match) -> Value {
     match m {
         Match::Words { from, to } => json!({
             "from": from, "to": to,
             "start": words.get(*from).map(|w| w.start.0), "end": words.get(*to).map(|w| w.end.0),
         }),
-        Match::Pause(q) => json!({"pauseAfter": q.after, "start": q.start.0, "end": q.end.0, "seconds": q.duration().seconds()}),
+        Match::Pause(q) => {
+            let mut v = pause_json(q, laughs);
+            if let Some(o) = v.as_object_mut() {
+                o.remove("after");
+                o.insert("pauseAfter".into(), json!(q.after));
+            }
+            v
+        }
     }
 }
 
@@ -697,23 +821,37 @@ fn search(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad("transcript.search", "`query` is required"));
     }
     let words = sequence_words(s);
-    let hits: Vec<Value> = matches(s, &words, filter, q, p).iter().map(|m| match_json(&words, m)).collect();
+    let laughs = sequence_laughs(s);
+    let hits: Vec<Value> = matches(s, &words, filter, q, p).iter().map(|m| match_json(&words, &laughs, m)).collect();
     Ok(json!({"filter": filter.name(), "count": hits.len(), "matches": hits}))
 }
 
-/// Timeline range of the words `from..=to` (frame-snapped outward), or of the pause after word
-/// `pauseAfter` (its silence less [`pause_handle`] next to both words, frame-snapped inward).
-fn range_p(s: &Session, p: &Value, cmd: &str) -> Result<TimeRange> {
+/// The timeline ranges that remove the words `from..=to` (one, frame-snapped outward), or the
+/// pause after word `pauseAfter` (its silence less [`pause_keep`] next to the sound on each side,
+/// frame-snapped inward; two or more with a laugh in it, which stays).
+fn ranges_p(s: &Session, p: &Value, cmd: &str) -> Result<Vec<TimeRange>> {
     let words = sequence_words(s);
     if let Some(after) = u64_p(p, "pauseAfter") {
         let pause =
             usize::try_from(after).ok().and_then(|a| tx::pause_after(&words, a)).ok_or_else(|| bad(cmd, format!("there is no pause after word {after}")))?;
-        return tx::pause_range(&pause, pause_handle(s, p), s.sequence_rate())
-            .ok_or_else(|| bad(cmd, "the pause is too short to delete once the silence kept next to the words is left"));
+        let cuts = tx::pause_cuts(&pause, &sequence_laughs(s), pause_keep(s, p), s.sequence_rate());
+        if cuts.is_empty() {
+            return Err(bad(cmd, "the pause is too short to delete once what is kept next to the sound around it is left"));
+        }
+        return Ok(cuts);
     }
     let from = u64_p(p, "from").ok_or_else(|| bad(cmd, "`from` (word index) or `pauseAfter` is required"))? as usize;
     let to = u64_p(p, "to").map(|n| n as usize).unwrap_or(from);
-    tx::word_range(&words, from, to, s.sequence_rate()).ok_or_else(|| bad(cmd, format!("word index out of range (the transcript has {} words)", words.len())))
+    let r = tx::word_range(&words, from, to, s.sequence_rate())
+        .ok_or_else(|| bad(cmd, format!("word index out of range (the transcript has {} words)", words.len())))?;
+    Ok(vec![r])
+}
+
+/// [`ranges_p`] and their span (In/Out of a selection).
+fn span_p(s: &Session, p: &Value, cmd: &str) -> Result<(Vec<TimeRange>, TimeRange)> {
+    let ranges = ranges_p(s, p, cmd)?;
+    let span = tx::cuts_extent(&ranges).ok_or_else(|| bad(cmd, "nothing to remove"))?;
+    Ok((ranges, span))
 }
 
 fn range_json(r: TimeRange) -> Value {
@@ -721,7 +859,7 @@ fn range_json(r: TimeRange) -> Value {
 }
 
 fn select(s: &mut Session, p: &Value) -> Result<Value> {
-    let r = range_p(s, p, "transcript.select")?;
+    let (_, r) = span_p(s, p, "transcript.select")?;
     let fd = s.sequence_rate().frame_duration();
     s.edit_sequence("Mark Transcript Selection", |q, _, _| {
         q.mark_in = Some(r.start);
@@ -734,20 +872,27 @@ fn select(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn extract_or_lift(s: &mut Session, p: &Value, extract: bool) -> Result<Value> {
     let cmd = if extract { "transcript.extract" } else { "transcript.lift" };
-    let r = range_p(s, p, cmd)?;
+    let (ranges, span) = span_p(s, p, cmd)?;
     let tg = s.targeting().targeted;
     s.edit_sequence(if extract { "Extract Text" } else { "Lift Text" }, |q, ctx, _| {
-        if extract {
-            edit::extract(q, &tg, r, ctx);
-        } else {
-            edit::lift(q, &tg, r, ctx);
+        // right to left, so the ranges before each one stay where they are
+        for r in ranges.iter().rev() {
+            if extract {
+                edit::extract(q, &tg, *r, ctx);
+            } else {
+                edit::lift(q, &tg, *r, ctx);
+            }
         }
         q.mark_in = None;
         q.mark_out = None;
         Ok(())
     })?;
-    s.set_playhead(r.start);
-    Ok(range_json(r))
+    s.set_playhead(span.start);
+    let mut v = range_json(span);
+    if let Some(o) = v.as_object_mut() {
+        o.insert("ranges".into(), ranges.iter().map(|r| range_json(*r)).collect());
+    }
+    Ok(v)
 }
 
 fn rename_speaker(s: &mut Session, p: &Value) -> Result<Value> {
@@ -798,8 +943,7 @@ fn remove_ranges(s: &mut Session, label: &str, ranges: Vec<TimeRange>) -> Result
 fn remove_pauses(s: &mut Session, p: &Value) -> Result<Value> {
     let words = sequence_words(s);
     let min = Tick::from_seconds_f64(f64_p(p, "minSeconds").unwrap_or(1.0));
-    let keep = pause_handle(s, p);
-    let ranges = tx::find_pauses(&words, min, keep, s.sequence_rate());
+    let ranges = tx::find_pauses(&words, &sequence_laughs(s), min, pause_keep(s, p), s.sequence_rate());
     remove_ranges(s, "Remove Pauses", ranges)
 }
 
@@ -811,12 +955,19 @@ fn remove_fillers(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// The timeline ranges that remove search matches: words frame-snapped outward (filler words to
-/// the nearest frames, never into their neighbours), pauses less `keep` of silence next to both
-/// words ([`pause_handle`]) and frame-snapped inward.
-pub fn match_ranges(words: &[SeqWord], found: &[Match], filter: Filter, keep: Tick, rate: filmcraft_time::FrameRate) -> Vec<TimeRange> {
+/// the nearest frames, never into their neighbours), pauses less `keep` next to the sound on each
+/// side ([`pause_keep`]) and frame-snapped inward, a laugh in them kept ([`tx::pause_cuts`]).
+pub fn match_ranges(
+    words: &[SeqWord],
+    laughs: &[TimeRange],
+    found: &[Match],
+    filter: Filter,
+    keep: tx::Keep,
+    rate: filmcraft_time::FrameRate,
+) -> Vec<TimeRange> {
     let spans: Vec<std::ops::Range<usize>> =
         found.iter().filter_map(|m| if let Match::Words { from, to } = m { Some(*from..to.saturating_add(1)) } else { None }).collect();
-    let pauses = found.iter().filter_map(|m| if let Match::Pause(q) = m { tx::pause_range(q, keep, rate) } else { None });
+    let pauses = found.iter().filter_map(|m| if let Match::Pause(q) = m { Some(q) } else { None }).flat_map(|q| tx::pause_cuts(q, laughs, keep, rate));
     match filter {
         Filter::Fillers => tx::filler_ranges(words, &spans, rate),
         Filter::Text => spans.iter().filter_map(|r| tx::word_range(words, r.start, r.end.saturating_sub(1), rate)).collect(),
@@ -837,7 +988,7 @@ fn delete_all(s: &mut Session, p: &Value) -> Result<Value> {
     let lift = bool_p(p, "lift").unwrap_or(false);
     let words = sequence_words(s);
     let found = matches(s, &words, filter, q, p);
-    let ranges = match_ranges(&words, &found, filter, pause_handle(s, p), s.sequence_rate());
+    let ranges = match_ranges(&words, &sequence_laughs(s), &found, filter, pause_keep(s, p), s.sequence_rate());
     let label = match (filter, lift) {
         (Filter::Fillers, false) => "Delete All Filler Words",
         (Filter::Pauses, false) => "Delete All Pauses",
@@ -940,9 +1091,18 @@ pub fn commands() -> Vec<CommandSpec> {
             "transcript.set",
             "Import Transcript",
             &[],
-            r#"{"item":id,"transcript":{"language":str,"speakers":[{"name":str}],"words":[{"text":str,"start":tick,"end":tick,"speaker":n?}]}}"#,
+            r#"{"item":id,"transcript":{"language":str,"speakers":[{"name":str}],"words":[{"text":str,"start":tick,"end":tick,"speaker":n?}],"laughs":[{"start":tick,"duration":tick}]?}}"#,
             always,
             set,
+            true,
+        ),
+        spec(
+            "transcript.findLaughs",
+            "Find Laughs in Pauses",
+            &[],
+            r#"{"items":[id]?,"audioStreams":{"<item>":n}?,"wait":bool=true} looks for laughs in the pauses of transcribed clips (deleting a pause keeps them); keeps the words"#,
+            has_transcripts,
+            find_laughs,
             true,
         ),
         spec("transcript.delete", "Delete Transcript", &["Sequence", "Transcript"], r#"{"items":[id]?}"#, has_transcripts, delete, true),
@@ -960,19 +1120,27 @@ pub fn commands() -> Vec<CommandSpec> {
             "transcript.deleteAll",
             "Delete All Matches",
             &[],
-            r#"{"filter":"text|fillers|pauses"=text,"query":str?,"lift":bool=false,"wholeWords":bool?,"matchCase":bool?,"minPauseSeconds":f?,"keepSeconds":f?,"fillers":[str]?}"#,
+            r#"{"filter":"text|fillers|pauses"=text,"query":str?,"lift":bool=false,"wholeWords":bool?,"matchCase":bool?,"minPauseSeconds":f?,"keepSeconds":f?,"keepAfterSeconds":f?,"keepBeforeSeconds":f?,"fillers":[str]?}"#,
             has_transcript,
             delete_all,
             true,
         ),
         spec("transcript.models", "List Speech Models", &[], "{}", always, models, false),
         spec("transcript.downloadModel", "Download Speech Model", &[], r#"{"model":"parakeet-tdt-0.6b-v3"?}"#, can_download, download_model, true),
-        spec("transcript.select", "Mark Selected Text", &[], r#"{"from":word,"to":word?}|{"pauseAfter":word,"keepSeconds":f?}"#, has_transcript, select, true),
+        spec(
+            "transcript.select",
+            "Mark Selected Text",
+            &[],
+            r#"{"from":word,"to":word?}|{"pauseAfter":word,"keepSeconds":f?,"keepAfterSeconds":f?,"keepBeforeSeconds":f?}"#,
+            has_transcript,
+            select,
+            true,
+        ),
         spec(
             "transcript.extract",
             "Extract Selected Text",
             &[],
-            r#"{"from":word,"to":word?}|{"pauseAfter":word,"keepSeconds":f?}"#,
+            r#"{"from":word,"to":word?}|{"pauseAfter":word,"keepSeconds":f?,"keepAfterSeconds":f?,"keepBeforeSeconds":f?}"#,
             has_transcript,
             |s, p| extract_or_lift(s, p, true),
             true,
@@ -981,7 +1149,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "transcript.lift",
             "Lift Selected Text",
             &[],
-            r#"{"from":word,"to":word?}|{"pauseAfter":word,"keepSeconds":f?}"#,
+            r#"{"from":word,"to":word?}|{"pauseAfter":word,"keepSeconds":f?,"keepAfterSeconds":f?,"keepBeforeSeconds":f?}"#,
             has_transcript,
             |s, p| extract_or_lift(s, p, false),
             true,
@@ -999,7 +1167,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "transcript.removePauses",
             "Remove Pauses",
             &["Sequence", "Transcript"],
-            r#"{"minSeconds":f?,"keepSeconds":f?}"#,
+            r#"{"minSeconds":f?,"keepSeconds":f?,"keepAfterSeconds":f?,"keepBeforeSeconds":f?}"#,
             has_transcript,
             remove_pauses,
             true,

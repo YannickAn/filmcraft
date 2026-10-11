@@ -186,11 +186,11 @@ fn pauses_are_found_and_removed_in_one_pass() {
     let mut q = whole();
     let w = sequence_words(&q, &transcripts());
     // only the 2 s pause after "show." is ≥ 1 s; 0.1 s is kept on each side
-    let p = find_pauses(&w, s(1.0), s(0.1), R);
+    let p = find_pauses(&w, &[], s(1.0), Keep::both(s(0.1)), R);
     assert_eq!(p.len(), 1);
     assert_eq!((p[0].start, p[0].end()), (s(1.80), s(3.60)));
     // 0.4 s threshold also finds 5.90→6.40 and 7.60→8.00
-    let p2 = find_pauses(&w, s(0.4), s(0.1), R);
+    let p2 = find_pauses(&w, &[], s(0.4), Keep::both(s(0.1)), R);
     assert_eq!(p2.len(), 3);
     let mut next = 1000;
     let mut ctx = EditCtx { next_id: &mut next, media_duration: &media_dur, media_start: &|_| Tick::ZERO, min_duration: R.frame_duration() };
@@ -202,7 +202,7 @@ fn pauses_are_found_and_removed_in_one_pass() {
     // the long pause is now 0.2 s
     assert_eq!(w2[4].start - w2[3].end, s(0.2));
     assert_eq!(w2.last().unwrap().end, s(10.0) - removed);
-    assert!(find_pauses(&w2, s(0.4), s(0.1), R).is_empty());
+    assert!(find_pauses(&w2, &[], s(0.4), Keep::both(s(0.1)), R).is_empty());
 }
 
 #[test]
@@ -238,14 +238,81 @@ fn pauses_are_listed_and_snapped_inward_one_at_a_time() {
     assert_eq!(pause_after(&w, 3), Some(p[0]));
     assert_eq!(pauses(&w, s(0.4)).len(), 3, "as many as find_pauses finds");
     // the whole pause, inward to frames: 1.70 → 1.72, 3.70 → 3.68
-    assert_eq!(pause_range(&p[0], Tick::ZERO, R), Some(TimeRange::from_bounds(s(1.72), s(3.68))));
-    assert_eq!(pause_range(&p[0], s(0.1), R), Some(TimeRange::from_bounds(s(1.80), s(3.60))));
-    assert_eq!(pause_range(&p[0], s(1.0), R), None, "nothing left to remove");
+    let cut = |k: Keep| pause_cuts(&p[0], &[], k, R);
+    assert_eq!(cut(Keep::both(Tick::ZERO)), [TimeRange::from_bounds(s(1.72), s(3.68))]);
+    assert_eq!(cut(Keep::both(s(0.1))), [TimeRange::from_bounds(s(1.80), s(3.60))]);
+    // less after the word than before the next: 1.75 → 1.76, 3.62 → 3.60
+    assert_eq!(cut(Keep { after: s(0.05), before: s(0.08) }), [TimeRange::from_bounds(s(1.76), s(3.60))]);
+    assert!(cut(Keep::both(s(1.0))).is_empty(), "nothing left to remove");
     // no pause after the last word, between touching words, or past the end
     assert_eq!(pause_after(&w, w.len() - 1), None);
     assert_eq!(pause_after(&w, usize::MAX), None);
     assert!(pauses(&[], s(0.1)).is_empty());
     assert!(pauses(&w, Tick::ZERO).iter().all(|p| p.end > p.start));
+}
+
+/// A laugh in a pause stays: the silence before and after it goes, less what is kept next to each
+/// sound. A cough is no laugh (the transcript lists only laughs), so it goes with the pause.
+#[test]
+fn a_laugh_in_a_pause_stays_and_the_silence_around_it_goes() {
+    let mut t = fixture();
+    // "show." ends at 1.70, "Um," starts at 3.70: a laugh 2.40–2.90 in between
+    t.laughs = Some(vec![TimeRange::from_bounds(s(2.40), s(2.90))]);
+    let mut m = Transcripts::new();
+    m.insert(MEDIA, Arc::new(t));
+    let mut q = whole();
+    let w = sequence_words(&q, &m);
+    let laughs = sequence_laughs(&q, &m);
+    assert_eq!(laughs, [TimeRange::from_bounds(s(2.40), s(2.90))]);
+    let p = pause_after(&w, 3).unwrap();
+    assert_eq!(pause_laughs(&p, &laughs), laughs);
+    let keep = Keep { after: s(0.04), before: s(0.08) };
+    // 1.74 → 1.76 … 2.32; 2.94 → 2.96 … 3.62 → 3.60
+    let cuts = pause_cuts(&p, &laughs, keep, R);
+    assert_eq!(cuts, [TimeRange::from_bounds(s(1.76), s(2.32)), TimeRange::from_bounds(s(2.96), s(3.60))]);
+    assert_eq!(cuts_extent(&cuts), Some(TimeRange::from_bounds(s(1.76), s(3.60))));
+    assert_eq!(cuts_extent(&[]), None);
+    // removing both leaves the laugh with the kept silence on its sides
+    let found = find_pauses(&w, &laughs, s(1.0), keep, R);
+    assert_eq!(found, cuts);
+    let mut next = 1000;
+    let mut ctx = EditCtx { next_id: &mut next, media_duration: &media_dur, media_start: &|_| Tick::ZERO, min_duration: R.frame_duration() };
+    ripple_delete_ranges(&mut q, found, &mut ctx);
+    q.check().unwrap();
+    let w2 = sequence_words(&q, &m);
+    let l2 = sequence_laughs(&q, &m);
+    assert_eq!(l2.len(), 1);
+    assert_eq!(l2[0].duration, s(0.5), "the whole laugh plays");
+    assert_eq!(l2[0].start - w2[3].end, s(0.14), "0.06 after the word (0.04, snapped inward), 0.08 before the laugh");
+    assert_eq!(w2[4].start - l2[0].end(), s(0.16), "0.06 after the laugh, 0.10 before the next word");
+    // a laugh touching a word: only the other side is cut; a laugh filling the pause: nothing
+    let touching = [TimeRange::from_bounds(s(1.70), s(2.20))];
+    assert_eq!(pause_cuts(&p, &touching, keep, R), [TimeRange::from_bounds(s(2.24), s(3.60))]);
+    assert!(pause_cuts(&p, &[TimeRange::from_bounds(s(1.0), s(5.0))], keep, R).is_empty());
+}
+
+/// Laughs map through clips like words: moved with the clip, through its speed, cut by its edges,
+/// and a clip under a transcribed clip on a higher track adds none.
+#[test]
+fn laughs_map_through_clips_and_tracks() {
+    let mut t = fixture();
+    t.laughs = Some(vec![TimeRange::from_bounds(s(2.40), s(2.90)), TimeRange::from_bounds(s(9.0), s(9.6))]);
+    let mut m = Transcripts::new();
+    m.insert(MEDIA, Arc::new(t));
+    let mut q = seq();
+    // media 2–6 at 10 s, at double speed: 2.40 → 10.20, 2.90 → 10.45; the second laugh is outside
+    let mut c = clip(100, 10.0, 2.0, 2.0);
+    c.speed = 2.0;
+    q.audio_tracks[0].items.push(c);
+    // the same media on A2 under it adds nothing
+    q.audio_tracks[1].items.push(clip(101, 10.0, 2.0, 2.0));
+    assert_eq!(sequence_laughs(&q, &m), [TimeRange::from_bounds(s(10.20), s(10.45))]);
+    // an old transcript (no laughs looked for) has none
+    let mut old = fixture();
+    old.laughs = None;
+    let mut m2 = Transcripts::new();
+    m2.insert(MEDIA, Arc::new(old));
+    assert!(sequence_laughs(&q, &m2).is_empty());
 }
 
 fn loose_words(texts: &[&str], item: u64) -> Vec<SeqWord> {

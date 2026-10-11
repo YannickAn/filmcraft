@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use crate::Session;
 use filmcraft_project::{ItemId, Transcript, Word};
 use filmcraft_speech::FixedTranscriber;
-use filmcraft_time::Tick;
+use filmcraft_time::{Tick, TimeRange};
 
 /// The demo project with a fake transcriber whose transcript fits the first A1 clip's media:
 /// "Hello um world." (Speaker 1), a 1.2 s pause, "Second speaker here." (Speaker 2).
@@ -352,15 +352,17 @@ fn timed_words(s: &mut Session) -> Vec<(String, Tick, Tick)> {
         .collect()
 }
 
-/// Deleting pauses never cuts into words: each pause keeps 0.15 s (Transcript view options ▸ Keep
-/// next to words) of its silence after the word before it and before the word after it, so a word
-/// whose transcript edge is a little late (a soft "s" at its start) keeps its start. Every word
-/// keeps its length; the 1.2 s pause becomes about 0.3 s.
+/// Deleting pauses cuts close to the words and never into them: each pause keeps 0.05 s after the
+/// word before it (Transcript view options ▸ Keep after words) and 0.08 s before the word after
+/// it (Keep before words: a soft first consonant a recogniser placed a little late keeps its
+/// start). Every word keeps its length; the 1.2 s pause becomes about 0.15 s.
 #[test]
-fn deleting_pauses_keeps_silence_next_to_the_words() {
+fn deleting_pauses_cuts_close_to_the_words_and_keeps_them_whole() {
     let (mut s, item, _) = session();
     s.execute("transcript.generate", json!({"items": [item.0]})).unwrap();
-    assert_eq!(s.prefs.transcript.pause_handle, 0.15);
+    assert_eq!((s.prefs.transcript.keep_after_words, s.prefs.transcript.keep_before_words), (0.05, 0.08));
+    let fd = s.sequence_rate().frame_duration();
+    let (keep_after, keep_before) = (Tick::from_seconds_f64(0.05), Tick::from_seconds_f64(0.08));
     let before = timed_words(&mut s);
     let r = s.execute("transcript.deleteAll", json!({"filter": "pauses"})).unwrap();
     assert_eq!(r["removed"], 1, "{r}");
@@ -369,30 +371,128 @@ fn deleting_pauses_keeps_silence_next_to_the_words() {
     for ((t0, a0, b0), (t1, a1, b1)) in before.iter().zip(&after) {
         assert_eq!((t0, *b0 - *a0), (t1, *b1 - *a1), "{t1} keeps its whole length");
     }
-    let keep = Tick::from_seconds_f64(0.15);
     let gap = after[3].1 - after[2].2;
-    assert!(gap >= keep + keep && gap < Tick::from_seconds_f64(0.4), "the pause after \"world.\" is {} s", gap.seconds());
-    // one pause the same way, and its In/Out shows what goes
+    assert!(gap >= keep_after + keep_before && gap <= keep_after + keep_before + fd + fd, "the pause after \"world.\" is {} s", gap.seconds());
+    // one pause the same way, and its In/Out shows what goes: from just after the word to just
+    // before the next
     s.execute("edit.undo", json!({})).unwrap();
     let r = s.execute("transcript.select", json!({"pauseAfter": 2})).unwrap();
     let (a, b) = (Tick(r["start"].as_i64().unwrap()), Tick(r["end"].as_i64().unwrap()));
-    assert!(a >= before[2].2 + keep && b <= before[3].1 - keep, "In/Out leave the silence next to the words");
-    s.execute("transcript.extract", json!({"pauseAfter": 2})).unwrap();
+    assert!(a >= before[2].2 + keep_after && a < before[2].2 + keep_after + fd, "In {} s after the word", (a - before[2].2).seconds());
+    assert!(b <= before[3].1 - keep_before && b > before[3].1 - keep_before - fd, "Out {} s before the next", (before[3].1 - b).seconds());
+    let r = s.execute("transcript.extract", json!({"pauseAfter": 2})).unwrap();
+    assert_eq!(r["ranges"].as_array().map(Vec::len), Some(1), "{r}");
     let after = timed_words(&mut s);
-    assert!(after[3].1 - after[2].2 >= keep + keep);
-    // a pause too short to delete once that is kept: an error, nothing changes
+    assert!(after[3].1 - after[2].2 >= keep_after + keep_before);
+    // a pause too short to delete once that is kept (0.1 s after "Hello"): an error, nothing changes
     s.execute("edit.undo", json!({})).unwrap();
     let e = s.execute("transcript.extract", json!({"pauseAfter": 0})).unwrap_err().to_string();
     assert!(e.contains("too short"), "{e}");
-    // the setting: per call, or Transcript view options ▸ Keep next to words
-    s.execute("prefs.set", json!({"key": "transcript.pauseHandle", "value": 0.3})).unwrap();
+    // per call: both sides, or each
+    let r = s.execute("transcript.select", json!({"pauseAfter": 2, "keepSeconds": 0.3})).unwrap();
+    assert!(Tick(r["start"].as_i64().unwrap()) >= before[2].2 + Tick::from_seconds_f64(0.3));
+    assert!(Tick(r["end"].as_i64().unwrap()) <= before[3].1 - Tick::from_seconds_f64(0.3));
+    let r = s.execute("transcript.select", json!({"pauseAfter": 2, "keepSeconds": 0.3, "keepAfterSeconds": 0.0})).unwrap();
+    assert!(Tick(r["start"].as_i64().unwrap()) < before[2].2 + fd, "nothing kept after the word");
+    // the settings: Transcript view options ▸ Keep after words / Keep before words
+    s.execute("prefs.set", json!({"key": "transcript.keepAfterWords", "value": 0.3})).unwrap();
+    s.execute("prefs.set", json!({"key": "transcript.keepBeforeWords", "value": 0.2})).unwrap();
     let r = s.execute("transcript.select", json!({"pauseAfter": 2})).unwrap();
     assert!(Tick(r["start"].as_i64().unwrap()) >= before[2].2 + Tick::from_seconds_f64(0.3));
+    assert!(Tick(r["end"].as_i64().unwrap()) <= before[3].1 - Tick::from_seconds_f64(0.2));
     for v in [json!(-1), json!(1e9)] {
-        s.execute("prefs.set", json!({"key": "transcript.pauseHandle", "value": v})).unwrap();
-        assert!((0.0..=1.0).contains(&s.prefs.transcript.pause_handle), "clamped");
+        s.execute("prefs.set", json!({"key": "transcript.keepAfterWords", "value": v})).unwrap();
+        s.execute("prefs.set", json!({"key": "transcript.keepBeforeWords", "value": v})).unwrap();
+        let t = &s.prefs.transcript;
+        assert!((0.0..=1.0).contains(&t.keep_after_words) && (0.0..=1.0).contains(&t.keep_before_words), "clamped");
     }
-    assert!(s.execute("transcript.deleteAll", json!({"filter": "pauses", "keepSeconds": f64::NAN})).is_ok());
+    assert!(s.execute("transcript.deleteAll", json!({"filter": "pauses", "keepSeconds": f64::NAN, "keepBeforeSeconds": f64::INFINITY})).is_ok());
+}
+
+/// The transcript with a laugh in the 1.2 s pause after "world." (media 1.8–2.2 s from the
+/// clip's In), as a recogniser that looked for laughs leaves it (brought by `transcript.set`, as
+/// an agent would).
+fn with_laugh(s: &mut Session, item: ItemId) {
+    let sin = s.active_sequence().unwrap().audio_tracks[0].items[0].source_in;
+    let mut t = (*s.project.transcripts[&item]).clone();
+    t.laughs = Some(vec![TimeRange::from_bounds(sin + Tick::from_seconds_f64(1.8), sin + Tick::from_seconds_f64(2.2))]);
+    s.execute("transcript.set", json!({"item": item.0, "transcript": serde_json::to_value(&t).unwrap()})).unwrap();
+    assert_eq!(s.project.transcripts[&item].laughs, t.laughs);
+}
+
+/// A laugh in a pause stays: deleting the pause cuts the silence before and after it, keeping 0.05 s
+/// after each sound and 0.08 s ahead of each; it plays whole. A cough there is no laugh, so it goes
+/// with the pause (the transcript lists only laughs).
+#[test]
+fn a_laugh_in_a_pause_stays_when_the_pause_is_deleted() {
+    let (mut s, item, _) = session();
+    s.execute("transcript.generate", json!({"items": [item.0]})).unwrap();
+    with_laugh(&mut s, item);
+    let laugh_at = |s: &mut Session| {
+        let r = s.execute("transcript.inspect", json!({})).unwrap();
+        let l = &r["laughs"][0];
+        (Tick(l["start"].as_i64().unwrap()), Tick(l["end"].as_i64().unwrap()))
+    };
+    let r = s.execute("transcript.inspect", json!({})).unwrap();
+    assert_eq!(r["laughsChecked"], true);
+    assert_eq!(r["pauses"][0]["after"], 2);
+    assert_eq!(r["pauses"][0]["laughs"].as_array().map(Vec::len), Some(1), "{}", r["pauses"]);
+    let (l0, l1) = laugh_at(&mut s);
+    assert_eq!(l1 - l0, Tick::from_seconds_f64(0.4));
+    // one pause: two cuts, In/Out around both, the laugh between them stays
+    let sel = s.execute("transcript.select", json!({"pauseAfter": 2})).unwrap();
+    assert!(Tick(sel["start"].as_i64().unwrap()) < l0 && Tick(sel["end"].as_i64().unwrap()) > l1);
+    let r = s.execute("transcript.extract", json!({"pauseAfter": 2})).unwrap();
+    assert_eq!(r["ranges"].as_array().map(Vec::len), Some(2), "{r}");
+    let w = timed_words(&mut s);
+    let (l0, l1) = laugh_at(&mut s);
+    assert_eq!(l1 - l0, Tick::from_seconds_f64(0.4), "the whole laugh plays");
+    let fd = s.sequence_rate().frame_duration();
+    let air = Tick::from_seconds_f64(0.13);
+    assert!(l0 - w[2].2 >= air && l0 - w[2].2 <= air + fd + fd, "{} s before the laugh", (l0 - w[2].2).seconds());
+    assert!(w[3].1 - l1 >= air && w[3].1 - l1 <= air + fd + fd, "{} s after it", (w[3].1 - l1).seconds());
+    // Delete all pauses does the same in one undo step
+    s.execute("edit.undo", json!({})).unwrap();
+    let undo = s.history.undo.len();
+    let r = s.execute("transcript.deleteAll", json!({"filter": "pauses"})).unwrap();
+    assert_eq!(r["removed"], 2, "{r}");
+    assert_eq!(s.history.undo.len(), undo + 1);
+    let (l0, l1) = laugh_at(&mut s);
+    assert_eq!(l1 - l0, Tick::from_seconds_f64(0.4));
+    // and Remove Pauses
+    s.execute("edit.undo", json!({})).unwrap();
+    let r = s.execute("transcript.removePauses", json!({"minSeconds": 1.0})).unwrap();
+    assert_eq!(r["removed"], 2, "{r}");
+    // a search lists the laugh with the pause
+    s.execute("edit.undo", json!({})).unwrap();
+    let r = s.execute("transcript.search", json!({"filter": "pauses"})).unwrap();
+    assert_eq!(r["matches"][0]["pauseAfter"], 2);
+    assert_eq!(r["matches"][0]["laughs"].as_array().map(Vec::len), Some(1));
+}
+
+/// Transcripts made before FilmCraft looked for laughs cut a pause whole; Find Laughs looks in
+/// their audio (the words stay), in one undo step.
+#[test]
+fn finding_laughs_in_an_old_transcript_keeps_its_words() {
+    let (mut s, item, _) = session();
+    assert!(s.execute("transcript.findLaughs", json!({})).is_err(), "nothing transcribed yet");
+    s.execute("transcript.generate", json!({"items": [item.0]})).unwrap();
+    assert_eq!(s.project.transcripts[&item].laughs, None);
+    assert_eq!(s.execute("transcript.inspect", json!({})).unwrap()["laughsChecked"], false);
+    let words_before = s.project.transcripts[&item].words.clone();
+    let r = s.execute("transcript.findLaughs", json!({})).unwrap();
+    assert_eq!(r["items"][0]["item"], item.0, "{r}");
+    assert!(r["items"][0]["laughs"].is_u64(), "{r}");
+    let t = s.project.transcripts[&item].clone();
+    assert!(t.laughs.is_some());
+    assert_eq!(t.words, words_before, "the words are the same");
+    assert_eq!(s.execute("transcript.inspect", json!({})).unwrap()["laughsChecked"], true);
+    assert_eq!(s.history.undo.last().map(|u| u.0.as_str()), Some("Find Laughs"));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.project.transcripts[&item].laughs, None);
+    // only transcribed items are looked at
+    let other = s.project.items.values().find(|i| i.as_media().is_some() && i.id != item).map(|i| i.id).unwrap();
+    assert!(s.execute("transcript.findLaughs", json!({"items": [other.0]})).is_err());
 }
 
 #[test]
