@@ -8,6 +8,7 @@
 //! | `file.closeAllProjects` / `file.closeAllOtherProjects` | File ▸ Close All Projects / Close All Other Projects |
 //! | `file.saveAsTemplate` | File ▸ Save as Template… (`file.templates`, `file.newProjectFromTemplate`) |
 //! | `file.importFromMediaBrowser` | File ▸ Import from Media Browser (⌥⌘I) |
+//! | `file.importFolder` | File ▸ Import Folder…: a folder's media into bins (`folder_import`) |
 //! | `file.exportSelectionProject` | File ▸ Export ▸ Selection as FilmCraft Project… |
 //! | `file.exportAle` | File ▸ Export ▸ Avid Log Exchange… |
 //! | `file.mediaPropertiesFile` / `file.mediaProperties` | File ▸ Get Media File Properties for ▸ File… / Selection… (⇧⌘H) |
@@ -116,6 +117,19 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         spec("file.importImageSequence", "Import Image Sequence…", &["File"], None, r#"{"path":str,"bin":binId?}"#, always, |s, p| {
             let path = p.get("path").and_then(Value::as_str).ok_or_else(|| bad("file.importImageSequence", "need `path` (the first numbered still)"))?;
             let mut q = json!({"paths": [path], "imageSequence": true});
+            if let Some(b) = p.get("bin") {
+                q["bin"] = b.clone();
+            }
+            s.execute("file.import", q)
+        }),
+        // The Import dialog's Import Folder: the folder's media into a bin of its name (the UI asks
+        // for the folder). `file.import` takes folder paths too, as a dropped folder.
+        spec("file.importFolder", "Import Folder…", &["File"], None, r#"{"path":str,"bin":binId?}"#, always, |s, p| {
+            let path = p.get("path").and_then(Value::as_str).ok_or_else(|| bad("file.importFolder", "need `path` (a folder)"))?;
+            if !s.services.is_dir(path) {
+                return Err(bad("file.importFolder", format!("{path} is not a folder")));
+            }
+            let mut q = json!({"paths": [path]});
             if let Some(b) = p.get("bin") {
                 q["bin"] = b.clone();
             }
@@ -252,7 +266,7 @@ pub(crate) fn apply_layout(v: &mut Vec<CommandSpec>) {
         (At::After("captions.showAll"), vec!["captions.showActiveOnly"]),
         (At::After("markers.addChapter"), vec!["markers.addFlashCue"]),
         (At::Before("file.close"), vec!["file.open"]),
-        (At::After("media.makeOffline"), vec!["file.importFromMediaBrowser", "file.import", "file.importImageSequence"]),
+        (At::After("media.makeOffline"), vec!["file.importFromMediaBrowser", "file.import", "file.importFolder", "file.importImageSequence"]),
     ];
     for (at, ids) in layout {
         let mut run = Vec::new();

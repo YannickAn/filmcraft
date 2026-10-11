@@ -169,6 +169,7 @@
 	Hide All Caption Tracks	Ocultar todas las pistas de subtítulos
 	High Quality Playback	Reproducción de alta calidad
 	History	Historial
+	Import Folder…	Importar carpeta…
 	Import From	Importar desde
 	Import Image Sequence…	Importar secuencia de imágenes…
 	Import from Media Browser	Importar desde el navegador de medios
@@ -3503,3 +3504,7 @@
 	Gradient Angle	Ángulo del degradado
 	Linear Gradient	Degradado lineal
 	Solid	Sólido
+
+# Importing folders (status bar).
+	Folder import: {items} imported	Importación de carpeta: {items} importados
+	Folder import: {items} imported, {skipped} skipped, {failed} failed (see the Events panel)	Importación de carpeta: {items} importados, {skipped} omitidos, {failed} con errores (ver el panel Eventos)

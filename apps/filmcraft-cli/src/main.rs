@@ -73,7 +73,7 @@ SUBCOMMANDS
   commands [filter] [--json]    list commands (id, label, shortcut, params)
   describe <id>                 one command as JSON (menu, shortcut, params, enabled now)
   inspect [project|sequence]    project tree or active sequence as JSON (default: both)
-  import <file>...              import media into the project
+  import <file|folder>...       import media into the project (a folder into bins)
   export <out> [--preset name] [--format f] [--range r] [--start s --end s] [--settings json]
          [--scale f] [--quality 0-100] [--no-audio] [--queue]
                                 export the active sequence and wait for it to finish: with an
@@ -342,7 +342,7 @@ async fn cli() {
             let paths: Vec<String> =
                 a.positionals[1..].iter().map(|p| std::fs::canonicalize(p).map(|c| c.to_string_lossy().into_owned()).unwrap_or_else(|_| p.clone())).collect();
             if paths.is_empty() {
-                usage("import <file>...");
+                usage("import <file|folder>...");
             }
             let mut b = Backend::open(&a);
             match b.exec("file.import", json!({"paths": paths})).await {

@@ -520,6 +520,52 @@ fn file_dialog_import_uses_shown_bin_unless_explicit() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A folder dropped on the Project panel (as from Explorer or Finder) and File ▸ Import Folder…
+/// import its media into bins named after its folders, inside the bin the panel shows.
+#[test]
+fn dropped_folders_import_into_bins() {
+    let dir = media_dir("drop-folder");
+    let mut d = Driver::with(Session::default());
+    let shown = d.exec("file.newBin", json!({"name": "Dailies"}))["bin"].as_u64().unwrap();
+    d.app().ui.project_panel.bin = Some(shown);
+    d.ok("ui.drop", json!({"paths": [dir.to_string_lossy()]}));
+    d.frames(2);
+    let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+    let names = |b: &filmcraft_project::Bin, p: &filmcraft_project::Project| -> Vec<String> {
+        let mut v: Vec<String> = b
+            .children
+            .iter()
+            .map(|e| match e {
+                BinEntry::Item(i) => p.item(*i).unwrap().name.clone(),
+                BinEntry::Bin(b) => format!("{}/", b.name),
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let bin_in = |b: &filmcraft_project::Bin, n: &str| -> filmcraft_project::Bin {
+        b.children.iter().find_map(|e| if let BinEntry::Bin(b) = e { (b.name == n).then(|| b.clone()) } else { None }).unwrap_or_else(|| panic!("no bin {n}"))
+    };
+    let p = d.app().session.project.clone();
+    let dailies = p.root.find_bin(filmcraft_project::BinId(shown)).unwrap();
+    let top = bin_in(dailies, &name);
+    assert_eq!(names(&top, &p), ["Selects/", "a-interview.wav", "b-roll.wav"]);
+    assert_eq!(names(&bin_in(&top, "Selects"), &p), ["pick.wav"]);
+    // readme.txt was skipped, and the status bar says so
+    let status = d.app().ui.status.clone();
+    assert!(status.contains("3 imported") && status.contains("1 skipped"), "{status}");
+    // File ▸ Import Folder… asks for the folder
+    let selects = dir.join("Selects").to_string_lossy().into_owned();
+    d.app().hooks.pick_folder = Some(Box::new(move || Some(selects.clone())));
+    d.app().ui.project_panel.bin = None;
+    let r = d.ok("ui.menu.invoke", json!({"id": "file.importFolder"}));
+    assert_eq!(r["items"].as_array().unwrap().len(), 1, "{r}");
+    let p = d.app().session.project.clone();
+    assert_eq!(names(&bin_in(&p.root, "Selects"), &p), ["pick.wav"]);
+    assert_eq!(d.app().ui.status, "Folder import: 1 imported");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn media_browser_navigation_import_and_columns() {
     let dir = media_dir("nav");

@@ -245,6 +245,8 @@ pub struct FilmcraftApp {
     deferred: Vec<(ControlRequest, f64)>,
     last_ui_time: f64,
     pub(crate) synthetic: Vec<egui::Event>,
+    /// Files and folders `ui.drop` drops on the window with the next frame's input.
+    pub(crate) drops: Vec<egui::DroppedFileHandle>,
     /// BS.1770 loudness of the programme as it plays, and the next sample position to feed.
     pub(crate) loudness: Option<(filmcraft_audio_dsp::LoudnessMeter, i64)>,
     /// Status message last shown and when it first appeared (messages expire after a few seconds).
@@ -448,6 +450,7 @@ impl FilmcraftApp {
             deferred: Vec::new(),
             last_ui_time: 0.0,
             synthetic: Vec::new(),
+            drops: Vec::new(),
             loudness: None,
             status_seen: (String::new(), 0.0),
             pending_screenshots: Vec::new(),
@@ -1074,12 +1077,15 @@ impl FilmcraftApp {
                 }
                 let bin = params.get("bin").cloned().unwrap_or_else(|| json!(self.import_bin().0));
                 let r = self.session.execute("file.import", json!({"paths": paths, "bin": bin})).map_err(|e| e.to_string());
-                if let Ok(v) = &r
-                    && let Some(errs) = v.get("errors").and_then(Value::as_array)
-                    && !errs.is_empty()
-                {
-                    self.ui.status = errs.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("; ");
-                }
+                self.report_import(&r);
+                r
+            }
+            // File ▸ Import Folder…: the folder's media into bins (the Import dialog's Import Folder)
+            "file.importFolder" => {
+                let Some(path) = self.hooks.pick_folder.as_mut().and_then(|f| f()) else { return Ok(Value::Null) };
+                let bin = params.get("bin").cloned().unwrap_or_else(|| json!(self.import_bin().0));
+                let r = self.session.execute("file.importFolder", json!({"path": path, "bin": bin})).map_err(|e| e.to_string());
+                self.report_import(&r);
                 r
             }
             // File ▸ Import with Image Sequence: choose the first numbered still
@@ -1162,7 +1168,8 @@ impl FilmcraftApp {
         r
     }
 
-    /// Import dropped files.
+    /// Import dropped files and folders (a folder's media goes into bins named after its folders)
+    /// into the bin the Project panel shows.
     fn handle_drops(&mut self, ctx: &egui::Context) {
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         let mut paths = Vec::new();
@@ -1173,7 +1180,32 @@ impl FilmcraftApp {
             }
         }
         if !paths.is_empty() {
-            let _ = self.session.execute("file.import", json!({"paths": paths, "bin": self.import_bin().0}));
+            let r = self.session.execute("file.import", json!({"paths": paths, "bin": self.import_bin().0})).map_err(|e| e.to_string());
+            self.report_import(&r);
+        }
+    }
+
+    /// Say in the status bar how an import went: what failed, or for folders what came in and
+    /// what was left out (the Events panel lists each).
+    fn report_import(&mut self, r: &Result<Value, String>) {
+        let v = match r {
+            Ok(v) => v,
+            Err(e) => {
+                self.ui.status = e.clone();
+                return;
+            }
+        };
+        let count = |k: &str| v.get(k).and_then(Value::as_array).map_or(0, Vec::len);
+        let errors: Vec<&str> = v.get("errors").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+        if v.get("bins").is_some() {
+            let (items, skipped, failed) = (count("items"), v["skippedCount"].as_u64().unwrap_or(0), errors.len());
+            self.ui.status = if skipped == 0 && failed == 0 {
+                tlf!("Folder import: {items} imported", items)
+            } else {
+                tlf!("Folder import: {items} imported, {skipped} skipped, {failed} failed (see the Events panel)", items, skipped, failed)
+            };
+        } else if !errors.is_empty() {
+            self.ui.status = errors.join("; ");
         }
     }
 
@@ -1642,6 +1674,8 @@ impl eframe::App for FilmcraftApp {
             };
             raw_input.events.extend(self.synthetic.drain(..n));
         }
+        // with the pointer move `ui.drop` queued before them, as the system delivers a drop
+        raw_input.dropped_files.append(&mut self.drops);
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {

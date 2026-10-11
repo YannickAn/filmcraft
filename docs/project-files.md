@@ -240,6 +240,31 @@ the items of an open dropdown; `settings.<key>.browse`, `settings.<key>.hex`;
 `settings.cancel`, `settings.ok`. The open dialog's page and draft are `ui.settings` in `ui.inspect`;
 `ui.set {"settings": {"page": id, "values": {key: value}}}` edits the draft (OK applies it).
 
+## Importing folders
+
+Dropping a folder from Explorer or Finder on the window, **File ▸ Import Folder…**
+(`file.importFolder {path, bin?}`) and `file.import` with a folder among its `paths` (the CLI's
+`import`, MCP `media_import`) import a folder as Premiere does: the folder becomes a bin of its name
+(inside `bin`, or the bin the Project panel shows), each sub-folder a bin inside it, and every
+video, audio and still file goes into the bin of its folder. Folders without media make no bin.
+
+- **Skipped, not errors:** files that are not media (documents, unsupported formats) and captions,
+  projects and interchange files (they add sequences and caption tracks: import them on their own)
+  are skipped. The result lists them as `skipped: [{path, reason}]` (the first 200) and
+  `skippedCount`; the Events panel gets one warning naming the first ten. Hidden files (a leading
+  dot, such as `._` resource forks on camera cards) are left alone. Files that fail to import are
+  `errors`, also listed in the Events panel. A folder with no media at all is an error.
+- **One undo step:** Undo takes back the whole import, its bins and files (`Import <folder>`).
+  When nothing could be imported, nothing changes.
+- **Hostile trees are bounded:** a folder reached again through a link (a symlink or junction back
+  to a parent) is entered once and listed as skipped; folders more than 32 levels below the
+  imported one are skipped; a walk stops after 2,000 folders, 200,000 entries or 10,000 media files,
+  imports what it found and reports why in `warnings` and the Events panel
+  (`crates/engine/src/folder_import.rs`).
+- With **Settings ▸ Media ▸ Import image sequences** on, a run of numbered stills in a folder is one
+  image-sequence clip from its lowest number, as a single numbered still is.
+- The result adds `bins` (the bins made) to `file.import`'s usual `items` and `errors`.
+
 ## Media: offline, relinking, proxies, ingest
 
 Media is referenced by path. Each imported file also records its **identity**
