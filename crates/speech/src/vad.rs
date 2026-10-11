@@ -147,40 +147,6 @@ pub fn speech_frames(db: &[f32], th: f32) -> Vec<bool> {
     out
 }
 
-/// Silence shorter than this (10 ms frames) is no silence of its own: the closure before a
-/// consonant, a breath's gap.
-const MIN_SILENCE_FRAMES: usize = 10;
-
-/// Where `audio` (16 kHz mono) is silent: no speech and no other sound next to it (see
-/// [`speech_frames_with_edges`]), in runs of at least 100 ms, in media time. A laugh, a cough or
-/// a breath held next to the words is sound, so a pause that holds one keeps it.
-pub fn silences(audio: &[f32]) -> Vec<filmcraft_time::TimeRange> {
-    let db = frame_db(audio);
-    silences_from_speech(&speech_frames_with_edges(&db, threshold(&db), edge_threshold(&db)))
-}
-
-/// [`silences`] from the speech frames already worked out.
-pub fn silences_from_speech(speech: &[bool]) -> Vec<filmcraft_time::TimeRange> {
-    let frame_ticks = TICKS_PER_SAMPLE * FRAME as i64;
-    let tick = |f: usize| filmcraft_time::Tick((f as i64).saturating_mul(frame_ticks));
-    let mut out = Vec::new();
-    // the first frame of the silent run being walked
-    let mut quiet_from = None;
-    for (i, &heard) in speech.iter().chain(std::iter::once(&true)).enumerate() {
-        match (heard, quiet_from) {
-            (false, None) => quiet_from = Some(i),
-            (true, Some(a)) => {
-                if i.saturating_sub(a) >= MIN_SILENCE_FRAMES {
-                    out.push(filmcraft_time::TimeRange::from_bounds(tick(a), tick(i)));
-                }
-                quiet_from = None;
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
 /// Move word bounds inward past silent frames (see the module docs).
 pub fn tighten_words(audio: &[f32], words: &mut [Word]) {
     let db = frame_db(audio);
@@ -324,21 +290,6 @@ mod tests {
         grow_speech(&[], &mut [true, false], -60.0);
         grow_speech(&[-10.0, -10.0], &mut [], -60.0);
         assert!(edge_threshold(&[]) < threshold(&[]));
-    }
-
-    /// Silence is where there is no sound at all: a laugh in the middle of a pause splits its
-    /// silence in two, a click far from speech does not, and short gaps are no silence.
-    #[test]
-    fn silences_leave_out_every_sound_not_just_speech() {
-        // speech 0.5–1.0, silence, a laugh 1.6–2.0 (as loud as speech), silence, speech 2.6–3.0,
-        // a 20 ms click at 3.5, silence to 4.0
-        let audio = audio_levels(64_000, &[(8_000..16_000, 0.3), (25_600..32_000, 0.3), (41_600..48_000, 0.3), (56_000..56_320, 0.3)]);
-        let sil = silences(&audio);
-        let r = |a: f64, b: f64| filmcraft_time::TimeRange::from_bounds(seconds_tick(a), seconds_tick(b));
-        assert_eq!(sil, [r(0.0, 0.5), r(1.0, 1.6), r(2.0, 2.6), r(3.0, 4.0)], "the laugh is sound, the click is not");
-        // a gap of 50 ms between sounds is no silence
-        assert!(silences_from_speech(&[true, false, false, false, false, false, true]).is_empty());
-        assert!(silences(&[]).is_empty());
     }
 
     #[test]

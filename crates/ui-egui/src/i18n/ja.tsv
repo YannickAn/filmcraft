@@ -3519,9 +3519,6 @@
 	Loading speech model…	音声モデルを読み込み中…
 	Match capitalization	大文字と小文字を区別
 	Keep next to words	単語の前後に残す無音
-	Measure Audio for Pauses	ポーズ用に音声を測定
-	Measure audio	音声を測定
-	Measure where the audio is silent, so pauses follow the sound and a laugh between words stays (the words are kept)	音声が無音の箇所を測定し、ポーズを音に合わせます。単語の間の笑い声は残ります（単語はそのまま）
 	Minimum pause length	最小ポーズの長さ
 	More options	その他のオプション
 	Next result	次の結果

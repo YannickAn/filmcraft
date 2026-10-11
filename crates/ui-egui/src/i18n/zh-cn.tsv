@@ -3508,9 +3508,6 @@
 	Loading speech model…	正在加载语音模型…
 	Match capitalization	区分大小写
 	Keep next to words	在词语旁保留
-	Measure Audio for Pauses	测量音频以检测停顿
-	Measure audio	测量音频
-	Measure where the audio is silent, so pauses follow the sound and a laugh between words stays (the words are kept)	测量音频静音的位置，使停顿跟随声音，词语之间的笑声保留（词语不变）
 	Minimum pause length	最短停顿时长
 	More options	更多选项
 	Next result	下一个结果
