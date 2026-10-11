@@ -264,6 +264,19 @@ video, audio and still file goes into the bin of its folder. Folders without med
 - With **Settings ▸ Media ▸ Import image sequences** on, a run of numbered stills in a folder is one
   image-sequence clip from its lowest number, as a single numbered still is.
 - The result adds `bins` (the bins made) to `file.import`'s usual `items` and `errors`.
+- **In the background, with progress:** drops and File ▸ Import Folder… (and `file.import` /
+  `file.importFolder` with `background: true`) look through the folders and open every file in a
+  job, so the window keeps working while a card of thousands of clips comes in. The Project panel
+  shows `Importing <folder>: 412 of 2000 files` with a progress bar and Cancel
+  (`project.import.progress`, `project.import.cancel`), the status bar `Importing… 21%`, the
+  Progress panel and `jobs.list` the job (`Import <folder>`: `done` / `total` files, `status`,
+  `etaSeconds`). When every file is open, the bins and items come in with one edit, as one undo
+  step, and the status bar says what came in and what was skipped. Cancel (or `jobs.cancel`), and
+  closing or replacing the project before it is done, import nothing. The command returns
+  `{job, background, label}` at once; `jobs.list` then shows what `file.import` returns under the
+  job's `import` (or `{error}`). With `wait: true` as well it returns that result itself. A file
+  that crashes its decoder while it is opened is one failed file, not a failed import. Without
+  `background` (the CLI and MCP in headless mode) the import runs in one go, still as one edit.
 
 ## Media: offline, relinking, proxies, ingest
 

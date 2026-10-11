@@ -1076,7 +1076,7 @@ impl FilmcraftApp {
                     return Ok(Value::Null);
                 }
                 let bin = params.get("bin").cloned().unwrap_or_else(|| json!(self.import_bin().0));
-                let r = self.session.execute("file.import", json!({"paths": paths, "bin": bin})).map_err(|e| e.to_string());
+                let r = self.session.execute("file.import", json!({"paths": paths, "bin": bin, "background": true})).map_err(|e| e.to_string());
                 self.report_import(&r);
                 r
             }
@@ -1084,7 +1084,7 @@ impl FilmcraftApp {
             "file.importFolder" => {
                 let Some(path) = self.hooks.pick_folder.as_mut().and_then(|f| f()) else { return Ok(Value::Null) };
                 let bin = params.get("bin").cloned().unwrap_or_else(|| json!(self.import_bin().0));
-                let r = self.session.execute("file.importFolder", json!({"path": path, "bin": bin})).map_err(|e| e.to_string());
+                let r = self.session.execute("file.importFolder", json!({"path": path, "bin": bin, "background": true})).map_err(|e| e.to_string());
                 self.report_import(&r);
                 r
             }
@@ -1169,7 +1169,8 @@ impl FilmcraftApp {
     }
 
     /// Import dropped files and folders (a folder's media goes into bins named after its folders)
-    /// into the bin the Project panel shows.
+    /// into the bin the Project panel shows. Folders import in the background (their files are
+    /// opened by a job with progress and Cancel) and come in when the job is done.
     fn handle_drops(&mut self, ctx: &egui::Context) {
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         let mut paths = Vec::new();
@@ -1180,13 +1181,14 @@ impl FilmcraftApp {
             }
         }
         if !paths.is_empty() {
-            let r = self.session.execute("file.import", json!({"paths": paths, "bin": self.import_bin().0})).map_err(|e| e.to_string());
+            let r = self.session.execute("file.import", json!({"paths": paths, "bin": self.import_bin().0, "background": true})).map_err(|e| e.to_string());
             self.report_import(&r);
         }
     }
 
     /// Say in the status bar how an import went: what failed, or for folders what came in and
-    /// what was left out (the Events panel lists each).
+    /// what was left out (the Events panel lists each). A folder import running in the background
+    /// is reported again when it is done ([`filmcraft_engine::Event::Imported`]).
     fn report_import(&mut self, r: &Result<Value, String>) {
         let v = match r {
             Ok(v) => v,
@@ -1195,6 +1197,13 @@ impl FilmcraftApp {
                 return;
             }
         };
+        if v.get("background").and_then(Value::as_bool) == Some(true) {
+            self.ui.status = match v.get("label").and_then(Value::as_str).and_then(|l| l.strip_prefix("Import ")) {
+                Some(name) => tlf!("Importing {name}…", name),
+                None => tl!("Importing…").to_string(),
+            };
+            return;
+        }
         let count = |k: &str| v.get(k).and_then(Value::as_array).map_or(0, Vec::len);
         let errors: Vec<&str> = v.get("errors").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
         if v.get("bins").is_some() {
@@ -1404,6 +1413,13 @@ impl FilmcraftApp {
                 filmcraft_engine::Event::RevealInProject(item) => self.reveal_in_project(item),
                 filmcraft_engine::Event::Toast { message, .. } => self.toast = Some((message, ctx.input(|i| i.time))),
                 filmcraft_engine::Event::ProjectChanged { .. } => {}
+                filmcraft_engine::Event::Imported { result, .. } => {
+                    let r = match result.get("error").and_then(Value::as_str) {
+                        Some(e) => Err(e.to_string()),
+                        None => Ok(result),
+                    };
+                    self.report_import(&r);
+                }
             }
         }
         self.sync_timeline_view();
@@ -1501,7 +1517,13 @@ impl FilmcraftApp {
         let p = ui.painter();
         p.rect_filled(bar, 3.0, t.separator);
         p.rect_filled(egui::Rect::from_min_size(bar.min, egui::vec2(bar.width() * f, bar.height())), 3.0, t.accent);
-        let verb = if job.label.starts_with("Rendering") { crate::i18n::t(&job.label).to_string() } else { tl!("Exporting").to_string() };
+        let verb = if job.label.starts_with("Rendering") {
+            crate::i18n::t(&job.label).to_string()
+        } else if job.label == "Import" || job.label.starts_with("Import ") {
+            tl!("Importing").to_string()
+        } else {
+            tl!("Exporting").to_string()
+        };
         p.text(
             egui::pos2(bar.min.x - 8.0, sb.center().y),
             egui::Align2::RIGHT_CENTER,

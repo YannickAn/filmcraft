@@ -32,38 +32,30 @@ impl BridgeClient {
         Ok(Self { addr, conn: Mutex::new(None), next_id: AtomicU64::new(1) })
     }
 
-    /// Run engine command `id` in the app. A blocking export (`file.exportMedia` with
-    /// `wait: true`, see [`crate::long_job::LONG_COMMANDS`]) is started as an app job and polled
-    /// here until it finishes, so the app keeps repainting (its status bar shows the progress) and
-    /// answering other requests, and no request waits on the control server's 60 s reply limit
-    /// (#91, #92). The reply is the same as a blocking export's: `{job, path, result}`, or the
-    /// export's error.
-    pub async fn execute(&self, id: &str, mut params: Value) -> Result<Value, AutomationError> {
+    /// Run engine command `id` in the app. A blocking export or folder import (`wait: true`, see
+    /// [`crate::long_job::LONG_COMMANDS`]) is started as an app job and polled here until it
+    /// finishes, so the app keeps repainting (its status bar shows the progress) and answering
+    /// other requests, and no request waits on the control server's 60 s reply limit (#91, #92).
+    /// The reply is the same as a blocking call's: an export's `{job, path, result}`, what
+    /// `file.import` returns, or the error.
+    pub async fn execute(&self, id: &str, params: Value) -> Result<Value, AutomationError> {
         if !crate::long_job::is_long(id, &params) {
             return self.call("engine.execute", json!({"command": id, "params": params})).await;
         }
-        if let Some(p) = params.as_object_mut() {
-            p.insert("wait".into(), json!(false));
-        }
-        let mut start = self.call("engine.execute", json!({"command": id, "params": params})).await?;
+        let params = crate::long_job::start_params(id, params);
+        let start = self.call("engine.execute", json!({"command": id, "params": params})).await?;
         let Some(job) = start.get("job").and_then(Value::as_u64) else { return Ok(start) };
-        let result = loop {
+        let entry = loop {
             tokio::time::sleep(JOB_POLL).await;
             let jobs = self.call("engine.execute", json!({"command": "jobs.list", "params": {}})).await?;
             let Some(j) = jobs.as_array().and_then(|a| a.iter().find(|j| j["id"].as_u64() == Some(job))).cloned() else {
-                break Value::Null;
+                break None;
             };
             if j["finished"].as_bool() == Some(true) {
-                break j["result"].clone();
+                break Some(j);
             }
         };
-        if let Some(e) = result.get("error").and_then(Value::as_str) {
-            return Err(AutomationError::App(format!("export failed: {e}")));
-        }
-        if let Some(o) = start.as_object_mut() {
-            o.insert("result".into(), result);
-        }
-        Ok(start)
+        crate::long_job::job_reply(id, start, entry.as_ref()).map_err(AutomationError::App)
     }
 
     /// Call a control method; returns `result` or the app's error.
@@ -135,10 +127,15 @@ mod tests {
                 log.lock().await.push(req.clone());
                 let reply = match req["params"]["command"].as_str() {
                     Some("file.exportMedia") => json!({"job": 7, "path": "/tmp/out.mov"}),
+                    Some("file.import") if req["params"]["params"]["background"] == json!(true) => json!({"job": 7, "background": true}),
                     Some("jobs.list") => {
                         polls += 1;
                         let finished = polls >= 3;
-                        json!([{"id": 7, "finished": finished, "result": if finished { result.clone() } else { Value::Null }}])
+                        let mut j = json!({"id": 7, "finished": finished, "result": if finished { result.clone() } else { Value::Null }});
+                        if finished && result.get("items").is_some() {
+                            j["import"] = result.clone();
+                        }
+                        json!([j])
                     }
                     _ => json!(null),
                 };
@@ -171,6 +168,20 @@ mod tests {
         let b = BridgeClient::new(addr).unwrap();
         let e = b.execute("file.exportMedia", json!({"path": "/tmp/out.mov", "wait": true})).await.unwrap_err();
         assert!(e.to_string().contains("export failed: encode: disk full"), "{e}");
+    }
+
+    /// A folder import with `wait: true` runs as an app job in the background too: the app stays
+    /// responsive while it opens thousands of files, and the caller gets what `file.import` returns.
+    #[tokio::test]
+    async fn a_blocking_folder_import_is_polled_as_a_job() {
+        let imported = json!({"job": 7, "items": [3, 4], "bins": [2], "errors": []});
+        let (addr, seen) = fake_app(imported.clone()).await;
+        let b = BridgeClient::new(addr).unwrap();
+        let r = b.execute("file.import", json!({"paths": ["/card"], "wait": true})).await.unwrap();
+        assert_eq!(r, imported);
+        let seen = seen.lock().await;
+        assert_eq!((&seen[0]["params"]["params"]["background"], &seen[0]["params"]["params"]["wait"]), (&json!(true), &json!(false)));
+        assert_eq!(seen.iter().filter(|q| q["params"]["command"] == "jobs.list").count(), 3);
     }
 
     /// Everything else is forwarded unchanged.

@@ -383,7 +383,8 @@ impl FilmcraftMcp {
     )]
     async fn media_import(&self, Parameters(p): Parameters<TypeParams>) -> Result<CallToolResult, McpError> {
         let paths: Vec<&str> = p.text.split('\n').map(str::trim).filter(|s| !s.is_empty()).collect();
-        wrap(self.run("file.import", json!({"paths": paths})).await)
+        // `wait`: in bridge mode a folder is imported as an app job (the app stays responsive)
+        wrap(self.run("file.import", json!({"paths": paths, "wait": true})).await)
     }
 
     #[tool(

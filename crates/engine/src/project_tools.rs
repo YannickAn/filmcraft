@@ -124,14 +124,16 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         }),
         // The Import dialog's Import Folder: the folder's media into a bin of its name (the UI asks
         // for the folder). `file.import` takes folder paths too, as a dropped folder.
-        spec("file.importFolder", "Import Folder…", &["File"], None, r#"{"path":str,"bin":binId?}"#, always, |s, p| {
+        spec("file.importFolder", "Import Folder…", &["File"], None, r#"{"path":str,"bin":binId?,"background":bool?,"wait":bool?}"#, always, |s, p| {
             let path = p.get("path").and_then(Value::as_str).ok_or_else(|| bad("file.importFolder", "need `path` (a folder)"))?;
             if !s.services.is_dir(path) {
                 return Err(bad("file.importFolder", format!("{path} is not a folder")));
             }
             let mut q = json!({"paths": [path]});
-            if let Some(b) = p.get("bin") {
-                q["bin"] = b.clone();
+            for k in ["bin", "background", "wait"] {
+                if let Some(v) = p.get(k) {
+                    q[k] = v.clone();
+                }
             }
             s.execute("file.import", q)
         }),

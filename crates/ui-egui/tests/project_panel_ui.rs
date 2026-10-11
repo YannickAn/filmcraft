@@ -9,11 +9,13 @@
 
 #![allow(dead_code)]
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
 
 use egui_kittest::Harness;
-use filmcraft_engine::Session;
 use filmcraft_engine::project_panel::{FREEFORM_POS, FREEFORM_STACK, ViewMode};
+use filmcraft_engine::{FsServices, Services, Session};
 use filmcraft_project::{BinEntry, ItemId};
 use filmcraft_ui_egui::FilmcraftApp;
 use filmcraft_ui_egui::control::ControlRequest;
@@ -114,6 +116,31 @@ impl Driver {
             self.frames(1);
         }
         panic!("{id} never appeared: {:?}", self.ids(id.split('.').next().unwrap()));
+    }
+
+    /// Step frames until the background import `job` is done.
+    fn wait_import(&mut self, job: u64) {
+        for _ in 0..3000 {
+            if self.app().session.imports.result(job).is_some() {
+                self.frames(1);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            self.frames(1);
+        }
+        panic!("import job {job} did not finish");
+    }
+
+    /// Step frames until `id` is gone (a background job is done).
+    fn wait_gone(&mut self, id: &str) {
+        for _ in 0..3000 {
+            if !self.has(id) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            self.frames(1);
+        }
+        panic!("{id} is still there: {}", self.label(id));
     }
 
     fn key(&mut self, key: &str) {
@@ -520,17 +547,75 @@ fn file_dialog_import_uses_shown_bin_unless_explicit() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// The disk through a slow card reader: opening a file waits while the gate is closed.
+struct SlowCard(Arc<AtomicBool>);
+
+impl SlowCard {
+    fn wait(&self) {
+        let t0 = std::time::Instant::now();
+        while !self.0.load(Ordering::Relaxed) && t0.elapsed() < std::time::Duration::from_secs(30) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
+impl Services for SlowCard {
+    fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        self.wait();
+        FsServices.read_file(path)
+    }
+    fn write_file(&self, path: &str, data: &[u8]) -> std::io::Result<()> {
+        FsServices.write_file(path, data)
+    }
+    fn file_size(&self, path: &str) -> std::io::Result<u64> {
+        FsServices.file_size(path)
+    }
+    fn read_range(&self, path: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        FsServices.read_range(path, offset, len)
+    }
+    fn reader(&self, path: &str) -> Option<std::io::Result<filmcraft_media::SharedReader>> {
+        self.wait();
+        FsServices.reader(path)
+    }
+    fn list_dir(&self, dir: &str) -> Option<std::io::Result<Vec<String>>> {
+        FsServices.list_dir(dir)
+    }
+    fn list_entries(&self, dir: &str) -> Option<std::io::Result<Vec<filmcraft_engine::media_browser::DirEntry>>> {
+        FsServices.list_entries(dir)
+    }
+    fn is_dir(&self, path: &str) -> bool {
+        FsServices.is_dir(path)
+    }
+    fn canonical_path(&self, path: &str) -> Option<String> {
+        FsServices.canonical_path(path)
+    }
+}
+
 /// A folder dropped on the Project panel (as from Explorer or Finder) and File ▸ Import Folder…
-/// import its media into bins named after its folders, inside the bin the panel shows.
+/// import its media into bins named after its folders, inside the bin the panel shows. The files
+/// are opened in the background: the window goes on, the Project panel and the status bar show
+/// how far it got (with Cancel), and the bins come in, as one undo step, when it is done.
 #[test]
-fn dropped_folders_import_into_bins() {
+fn dropped_folders_import_into_bins_in_the_background() {
     let dir = media_dir("drop-folder");
-    let mut d = Driver::with(Session::default());
+    let gate = Arc::new(AtomicBool::new(false));
+    let mut d = Driver::with(Session::new(Arc::new(SlowCard(gate.clone()))));
     let shown = d.exec("file.newBin", json!({"name": "Dailies"}))["bin"].as_u64().unwrap();
     d.app().ui.project_panel.bin = Some(shown);
+    let undo = d.app().session.history.undo.len();
     d.ok("ui.drop", json!({"paths": [dir.to_string_lossy()]}));
     d.frames(2);
     let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+    // the card is slow: nothing came in yet, and the window says what it is doing
+    d.wait_for("project.import.progress");
+    let progress = d.label("project.import.progress");
+    assert!(progress.starts_with(&format!("Importing {name}: ")), "{progress}");
+    assert!(d.has("project.import.cancel") && d.has("status.job.cancel"), "{:?}", d.ids("status"));
+    assert_eq!(d.app().ui.status, format!("Importing {name}…"));
+    let in_dailies = |d: &mut Driver| d.app().session.project.root.find_bin(filmcraft_project::BinId(shown)).map_or(0, |b| b.children.len());
+    assert_eq!(in_dailies(&mut d), 0);
+    gate.store(true, Ordering::Relaxed);
+    d.wait_gone("project.import.progress");
     let names = |b: &filmcraft_project::Bin, p: &filmcraft_project::Project| -> Vec<String> {
         let mut v: Vec<String> = b
             .children
@@ -551,6 +636,7 @@ fn dropped_folders_import_into_bins() {
     let top = bin_in(dailies, &name);
     assert_eq!(names(&top, &p), ["Selects/", "a-interview.wav", "b-roll.wav"]);
     assert_eq!(names(&bin_in(&top, "Selects"), &p), ["pick.wav"]);
+    assert_eq!(d.app().session.history.undo.len(), undo + 1);
     // readme.txt was skipped, and the status bar says so
     let status = d.app().ui.status.clone();
     assert!(status.contains("3 imported") && status.contains("1 skipped"), "{status}");
@@ -559,10 +645,23 @@ fn dropped_folders_import_into_bins() {
     d.app().hooks.pick_folder = Some(Box::new(move || Some(selects.clone())));
     d.app().ui.project_panel.bin = None;
     let r = d.ok("ui.menu.invoke", json!({"id": "file.importFolder"}));
-    assert_eq!(r["items"].as_array().unwrap().len(), 1, "{r}");
+    assert!(r["background"] == json!(true), "{r}");
+    d.wait_import(r["job"].as_u64().unwrap());
     let p = d.app().session.project.clone();
     assert_eq!(names(&bin_in(&p.root, "Selects"), &p), ["pick.wav"]);
     assert_eq!(d.app().ui.status, "Folder import: 1 imported");
+    // Cancel in the Project panel: nothing comes in
+    gate.store(false, Ordering::Relaxed);
+    d.ok("ui.drop", json!({"paths": [dir.to_string_lossy()]}));
+    d.frames(2);
+    d.wait_for("project.import.cancel");
+    let before = d.app().session.project.clone();
+    d.click("project.import.cancel");
+    gate.store(true, Ordering::Relaxed);
+    d.wait_gone("project.import.progress");
+    assert!(Arc::ptr_eq(&d.app().session.project, &before));
+    let status = d.app().ui.status.clone();
+    assert!(status.starts_with("Cancelled"), "{status}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

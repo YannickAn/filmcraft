@@ -377,7 +377,8 @@ pub(crate) fn default_seq_settings_for(media: &MediaClip) -> SequenceSettings {
 }
 
 /// `file.import`: files and folders (a folder's media into bins named after its folders, see
-/// [`crate::folder_import`]).
+/// [`crate::folder_import`]). With `background`, a job looks through the folders and opens their
+/// files (progress, Cancel) while the user works on, and they come in when it is done.
 fn file_import(s: &mut Session, p: &Value) -> Result<Value> {
     let bin = u64_p(p, "bin").map(filmcraft_project::BinId);
     let paths: Vec<String> = match p.get("paths").and_then(Value::as_array) {
@@ -397,7 +398,12 @@ fn file_import(s: &mut Session, p: &Value) -> Result<Value> {
         [one] => format!("Import {}", crate::folder_import::folder_name(one)),
         _ => "Import".to_string(),
     };
-    s.grouped(|s| Ok((import_paths(s, p, &paths, bin)?, label)))
+    if bool_p(p, "background").unwrap_or(false) {
+        return crate::folder_import::start(s, paths, bin, label, bool_p(p, "wait").unwrap_or(false));
+    }
+    let found = crate::folder_import::scan(&crate::folder_import::Request::new(s, paths), None)
+        .ok_or_else(|| EngineError::Other(crate::folder_import::CANCELLED.into()))?;
+    crate::folder_import::finish(s, found, bin, label)
 }
 
 fn import_paths(s: &mut Session, p: &Value, paths: &[String], bin: Option<filmcraft_project::BinId>) -> Result<Value> {
@@ -406,17 +412,16 @@ fn import_paths(s: &mut Session, p: &Value, paths: &[String], bin: Option<filmcr
     // Settings ▸ Media ▸ Import image sequences on, a single numbered still is detected.
     let as_sequence = p.get("imageSequence").and_then(Value::as_bool).unwrap_or(false);
     let detect = !as_sequence && s.prefs.media.import_image_sequences && paths.len() == 1;
-    // A folder imports its media into a bin of its name, sub-folders into sub-bins.
-    let mut folders = crate::folder_import::Walk::default();
-    let mut any_folder = false;
     for path in paths {
-        if !as_sequence && s.services.is_dir(path) {
-            any_folder = true;
-            crate::folder_import::import(s, path, bin, &mut folders, &mut got);
-        } else {
-            import_one(s, path, bin, as_sequence, detect, &mut got);
-        }
+        import_one(s, path, bin, as_sequence, detect, &mut got);
     }
+    finish_import(s, got, None)
+}
+
+/// What `file.import` returns for what came in (`folders`: the walk of the folders among its
+/// paths), after Project Settings ▸ Ingest and automatic transcription. The files that failed are
+/// listed in the Events panel; an error when nothing came in.
+pub(crate) fn finish_import(s: &mut Session, got: Imported, folders: Option<&crate::folder_import::Walk>) -> Result<Value> {
     let Imported { ids, mut errors, sequences, reports, image_sequences } = got;
     if ids.is_empty() && sequences.is_empty() && reports.is_empty() && !errors.is_empty() {
         // nothing came in (a folder's bins are taken back with it, see `file_import`)
@@ -457,14 +462,18 @@ fn import_paths(s: &mut Session, p: &Value, paths: &[String], bin: Option<filmcr
     }
     // Newly imported files may resolve paths the project already listed as offline
     // (issue #110): rebuild s.offline.missing so the "Media missing" badge clears, and drop
-    // the cached slate of every item that came back so the monitors show the file again.
+    // the cached slate of every item that came back so the monitors show the file again. (The
+    // rescan looks at every file of the project: not when nothing was missing, so that a big
+    // import doesn't wait on thousands of file lookups.)
     let was_missing = s.offline.missing.clone();
-    crate::relink::refresh(s);
+    if !was_missing.is_empty() {
+        crate::relink::refresh(s);
+    }
     for item in was_missing.iter().filter(|i| !s.offline.missing.contains(i)) {
         s.media.remove(*item);
     }
-    if any_folder {
-        folders.report(s, &mut out);
+    if let Some(w) = folders {
+        w.report(s, &mut out);
     }
     // The files that failed while others came in are listed in the Events panel.
     const LOGGED_ERRORS: usize = 20;
@@ -578,36 +587,40 @@ fn import_source(
     identity: filmcraft_project::MediaIdentity,
     bin: Option<filmcraft_project::BinId>,
 ) -> Result<ItemId> {
+    let (label, kind) = media_item(&s.prefs, path, &src, identity);
+    let id = s.edit(&format!("Import {name}"), |p, _| Ok(p.add_item(&name, label, kind, bin)))?;
+    s.media.insert_file(id, path, src);
+    Ok(id)
+}
+
+/// The Project panel item of a media file opened from `path`: its label (Settings ▸ Labels ▸
+/// Label Defaults) and the clip.
+pub(crate) fn media_item(
+    prefs: &crate::autosave::Preferences,
+    path: &str,
+    src: &filmcraft_media::SharedSource,
+    identity: filmcraft_project::MediaIdentity,
+) -> (Label, ItemKind) {
     let mut info = src.info().clone();
-    // Settings ▸ Labels ▸ Label Defaults
-    let label = s.prefs.labels.for_media(info.kind, info.has_video(), info.has_audio());
+    let label = prefs.labels.for_media(info.kind, info.has_video(), info.has_audio());
     // Settings ▸ Media ▸ Indeterminate Media Timebase: the frame rate stills report
     if info.kind == filmcraft_media::MediaKind::Still
         && let Some(v) = info.video.as_mut()
     {
-        v.frame_rate = crate::settings::timebase_rate(&s.prefs.media.indeterminate_timebase);
+        v.frame_rate = crate::settings::timebase_rate(&prefs.media.indeterminate_timebase);
     }
-    let path_s = path.to_string();
-    let id = s.edit(&format!("Import {name}"), |p, _| {
-        Ok(p.add_item(
-            &name,
-            label,
-            ItemKind::Media(MediaClip {
-                media: MediaRef::File { path: path_s },
-                info,
-                interpret: Default::default(),
-                mark_in: None,
-                mark_out: None,
-                markers: vec![],
-                offline: false,
-                proxy: None,
-                identity: Some(identity),
-            }),
-            bin,
-        ))
-    })?;
-    s.media.insert_file(id, path, src);
-    Ok(id)
+    let clip = MediaClip {
+        media: MediaRef::File { path: path.to_string() },
+        info,
+        interpret: Default::default(),
+        mark_in: None,
+        mark_out: None,
+        markers: vec![],
+        offline: false,
+        proxy: None,
+        identity: Some(identity),
+    };
+    (label, ItemKind::Media(clip))
 }
 
 fn new_generator(s: &mut Session, g: Generator, name: &str, label: Label, p: &Value) -> Result<Value> {
@@ -1062,7 +1075,15 @@ fn build() -> Vec<CommandSpec> {
                 Ok(json!({"items": ids.iter().map(|i| i.0).collect::<Vec<_>>()}))
             }
         ),
-        cmd!("file.import", "Import…", ["File"], Some("Cmd+I"), r#"{"paths":[str],"bin":binId?,"imageSequence":bool?}"#, always, file_import),
+        cmd!(
+            "file.import",
+            "Import…",
+            ["File"],
+            Some("Cmd+I"),
+            r#"{"paths":[str],"bin":binId?,"imageSequence":bool?,"background":bool?,"wait":bool?}"#,
+            always,
+            file_import
+        ),
         cmd!(
             "file.exportInterchange",
             "Export Interchange",
@@ -1225,7 +1246,19 @@ fn build() -> Vec<CommandSpec> {
             has_seq,
             crate::export_tools::export_media
         ),
-        query!("jobs.list", "List Jobs", "{}", |s, _| Ok(Value::Array(s.jobs.iter().map(crate::Job::to_json).collect()))),
+        query!("jobs.list", "List Jobs", "{}", |s, _| {
+            // background folder imports come in when their files are open (headless hosts have no
+            // frame loop to do it)
+            crate::folder_import::poll(s);
+            let jobs = s.jobs.iter().map(|j| {
+                let mut v = j.to_json();
+                if let Some(r) = s.imports.result(j.id) {
+                    v["import"] = r.clone();
+                }
+                v
+            });
+            Ok(Value::Array(jobs.collect()))
+        }),
         query!("perf.stats", "Performance Statistics", "{}", |s, _| Ok(crate::perf::stats(s))),
         cmd!("jobs.cancel", "Cancel Job", [], None, r#"{"job":id}"#, always, |s, p| {
             let id = u64_p(p, "job").ok_or_else(|| bad("jobs.cancel", "need `job`"))?;
