@@ -171,6 +171,7 @@
 	Hide All Caption Tracks	すべてのキャプショントラックを非表示
 	High Quality Playback	高画質再生
 	History	履歴
+	Import Folder…	フォルダーを読み込み…
 	Import From	読み込み元
 	Import Image Sequence…	連番画像を読み込み…
 	Import from Media Browser	メディアブラウザーから読み込み
@@ -3581,3 +3582,6 @@
 	Recover Unsaved Changes Later	未保存の変更を後で復元
 	Set Track Height	トラックの高さを設定
 	Logarithmic Waveform Scaling	波形を対数スケールで表示
+# Importing folders (status bar).
+	Folder import: {items} imported	フォルダーの読み込み: {items} 件を読み込みました
+	Folder import: {items} imported, {skipped} skipped, {failed} failed (see the Events panel)	フォルダーの読み込み: {items} 件を読み込み、{skipped} 件をスキップ、{failed} 件が失敗しました（イベントパネルを参照）

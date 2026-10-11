@@ -15,6 +15,8 @@
 //! - `ui.panel.show {panel}` / `ui.panel.close {panel}`
 //! - `ui.click {id | x,y, button?, count?, modifiers?}` / `ui.move {x,y}` / `ui.scroll {x,y,dx,dy}`
 //! - `ui.drag {from:{id|x,y}, to:{id|x,y}, steps?, modifiers?}`: synthetic press-move-release
+//! - `ui.drop {paths, id? | x,y?}`: drop files and folders on the window as from Explorer or
+//!   Finder (default: on the Project panel); a folder imports its media into bins
 //! - `ui.key {key, command?, shift?, alt?, ctrl?}` / `ui.type {text}`
 //! - `ui.timeline.hit {x, y, modifiers?}`: what the timeline shows at a point (track, clip, edge,
 //!   time) and `kind`, the trim a press of the current tool with `modifiers` starts there
@@ -432,6 +434,26 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
             release_modifiers(app, m);
             Outcome::AfterInput
         }
+        // files and folders dropped on the window from the system's file manager (Explorer, Finder)
+        "ui.drop" => {
+            let Some(paths) = p.get("paths").and_then(Value::as_array) else { return err("need `paths`") };
+            let paths: Vec<std::path::PathBuf> = paths.iter().filter_map(Value::as_str).map(std::path::PathBuf::from).collect();
+            if paths.is_empty() {
+                return err("need `paths`");
+            }
+            let at = if p.get("id").is_some() || p.get("x").is_some() {
+                match point(app, p) {
+                    Ok(p) => p,
+                    Err(e) if e.starts_with(RETRY) => return Outcome::Retry(e.trim_start_matches(RETRY).to_string()),
+                    Err(e) => return err(e),
+                }
+            } else {
+                app.auto.find("panel.project").map_or(egui::pos2(100.0, 100.0), |e| egui::pos2(e.rect[0] + e.rect[2] / 2.0, e.rect[1] + e.rect[3] / 2.0))
+            };
+            app.synthetic.push(egui::Event::PointerMoved(at));
+            app.drops.extend(paths.into_iter().map(|p| std::sync::Arc::new(ControlDrop(p)) as egui::DroppedFileHandle));
+            Outcome::AfterInput
+        }
         "ui.scroll" => {
             let pos = match point(app, p) {
                 Ok(p) => p,
@@ -513,6 +535,24 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
             ok(Value::Null)
         }
         m => err(format!("unknown method `{m}`")),
+    }
+}
+
+/// A file or folder `ui.drop` drops on the window, as the system's drag and drop delivers one.
+#[derive(Debug)]
+pub(crate) struct ControlDrop(std::path::PathBuf);
+
+impl egui::DroppedFile for ControlDrop {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        std::fs::read(&self.0).map_err(|e| e.to_string())
+    }
+    #[cfg(target_arch = "wasm32")]
+    fn bytes_async(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + '_>> {
+        Box::pin(std::future::ready(Err("no file data on the web".to_string())))
     }
 }
 

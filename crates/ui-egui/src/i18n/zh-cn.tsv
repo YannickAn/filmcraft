@@ -164,6 +164,7 @@
 	Hide All Caption Tracks	隐藏所有字幕轨道
 	High Quality Playback	高质量播放
 	History	历史记录
+	Import Folder…	导入文件夹…
 	Import From	导入来源
 	Import Image Sequence…	导入图像序列…
 	Import from Media Browser	从媒体浏览器导入
@@ -3575,3 +3576,6 @@
 	Recover Unsaved Changes Later	稍后恢复未保存的更改
 	Set Track Height	设置轨道高度
 	Logarithmic Waveform Scaling	波形对数缩放
+# Importing folders (status bar).
+	Folder import: {items} imported	文件夹导入：已导入 {items} 个
+	Folder import: {items} imported, {skipped} skipped, {failed} failed (see the Events panel)	文件夹导入：已导入 {items} 个，跳过 {skipped} 个，失败 {failed} 个（见“事件”面板）

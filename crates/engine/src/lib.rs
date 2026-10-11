@@ -20,6 +20,7 @@ pub mod commands;
 pub mod demo;
 pub mod essential_sound;
 pub mod export_tools;
+pub mod folder_import;
 pub mod graphic_templates;
 pub mod graphics;
 pub mod interchange;
@@ -144,6 +145,16 @@ pub trait Services: Send + Sync {
     fn home_dir(&self) -> Option<String> {
         None
     }
+    /// Whether `path` is a directory (`file.import` of a folder imports its media into bins).
+    /// The default: hosts without folders have none.
+    fn is_dir(&self, _path: &str) -> bool {
+        false
+    }
+    /// `path` with links resolved, so a folder import enters each directory once (a link back to
+    /// a parent is a loop). `None`: the host has no links; the path is used as it is.
+    fn canonical_path(&self, _path: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Native filesystem services.
@@ -181,6 +192,12 @@ impl Services for FsServices {
     fn home_dir(&self) -> Option<String> {
         media_browser::std_home_dir()
     }
+    fn is_dir(&self, path: &str) -> bool {
+        std::fs::metadata(path).is_ok_and(|m| m.is_dir())
+    }
+    fn canonical_path(&self, path: &str) -> Option<String> {
+        std::fs::canonicalize(path).ok().map(|p| p.to_string_lossy().into_owned())
+    }
     fn read_range(&self, path: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
         use std::io::{Read, Seek, SeekFrom};
         let mut f = std::fs::File::open(path)?;
@@ -217,6 +234,18 @@ pub struct History {
     /// Key of the last [`Session::edit_merged`] step: a continuous gesture (a fader drag) with the
     /// same key folds into that one undo step.
     pub merge_key: Option<String>,
+    /// The open [`Session::grouped`] run: its edits make no undo steps of their own.
+    group: Option<UndoGroup>,
+}
+
+/// Edits of a [`Session::grouped`] run so far.
+#[derive(Clone)]
+struct UndoGroup {
+    /// The project when the run started.
+    before: Arc<Project>,
+    edits: usize,
+    /// The label of its first edit (the step's name when it is the only one).
+    first: String,
 }
 
 impl History {
@@ -690,12 +719,22 @@ impl Session {
             return Err(e);
         }
         self.exec_depth += 1;
+        let grouping = self.history.group.is_some();
         // Last-resort guard: a panic in a command (a bug that escaped the never-crash rules)
         // becomes an error for the caller (UI, CLI, control channel, MCP) instead of taking the
         // session and its unsaved project down. The panic hook has logged where it happened.
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.run)(self, &params)))
             .unwrap_or_else(|_| Err(EngineError::Other(format!("internal error in `{id}` (see the crash log); the command did not complete"))));
         self.exec_depth -= 1;
+        // a panic inside a grouped run this command opened left it open: what it changed stays one
+        // undoable step
+        if self.exec_depth == 0
+            && !grouping
+            && let Some(g) = self.history.group.take()
+            && g.edits > 0
+        {
+            self.push_undo(if g.first.is_empty() { id.to_string() } else { g.first }, g.before);
+        }
         // source graphics: an edited instance updates the shared layers and the other instances
         if r.is_ok() && spec.journal && id.starts_with("graphics.") && !self.project.source_graphics.is_empty() {
             graphic_templates::sync_source_graphics(self);
@@ -835,9 +874,14 @@ impl Session {
         let r = f(&mut p, &mut st)?;
         self.refuse_self_nesting(&p)?;
         let old = std::mem::replace(&mut self.project, Arc::new(p));
-        self.history.undo.push((label.to_string(), old));
-        if self.history.undo.len() > self.history.limit {
-            self.history.undo.remove(0);
+        match self.history.group.as_mut() {
+            Some(g) => {
+                g.edits += 1;
+                if g.edits == 1 {
+                    g.first = label.to_string();
+                }
+            }
+            None => self.push_undo(label.to_string(), old),
         }
         self.history.redo.clear();
         self.history.merge_key = None;
@@ -901,6 +945,51 @@ impl Session {
         match merge {
             Some(key) => self.edit_merged(label, key, body),
             None => self.edit(label, body),
+        }
+    }
+
+    fn push_undo(&mut self, label: String, before: Arc<Project>) {
+        self.history.undo.push((label, before));
+        if self.history.undo.len() > self.history.limit {
+            self.history.undo.remove(0);
+        }
+    }
+
+    /// Run `f` as one undo step: its edits make no steps (and keep no snapshots) of their own,
+    /// whatever the history limit, so importing a folder of hundreds of files is one Undo Import,
+    /// as in Premiere. The step is named after `f`'s only edit, or the label `f` returns when it
+    /// made several. When `f` fails, every edit it made is taken back. Nested runs join the outer one.
+    pub(crate) fn grouped<R>(&mut self, f: impl FnOnce(&mut Session) -> Result<(R, String)>) -> Result<R> {
+        let start = UndoGroup { before: self.project.clone(), edits: 0, first: String::new() };
+        let outer = self.history.group.replace(start);
+        self.history.merge_key = None;
+        let r = f(self);
+        let Some(g) = std::mem::replace(&mut self.history.group, outer) else { return r.map(|(v, _)| v) };
+        match r {
+            Err(e) => {
+                if g.edits > 0 {
+                    self.project = g.before;
+                    self.fix_state();
+                    self.bump();
+                }
+                Err(e)
+            }
+            Ok((v, label)) => {
+                if g.edits > 0 {
+                    let label = if g.edits == 1 { g.first } else { label };
+                    match self.history.group.as_mut() {
+                        Some(o) => {
+                            if o.edits == 0 {
+                                o.first = label;
+                            }
+                            o.edits += g.edits;
+                        }
+                        None => self.push_undo(label, g.before),
+                    }
+                    self.history.merge_key = None;
+                }
+                Ok(v)
+            }
         }
     }
 
@@ -1146,6 +1235,8 @@ mod explicit_targets_tests;
 mod export_tests;
 #[cfg(test)]
 mod file_tests;
+#[cfg(test)]
+mod folder_import_tests;
 #[cfg(test)]
 mod gap_selection_tests;
 #[cfg(test)]

@@ -435,7 +435,7 @@ impl FilmcraftMcp {
 
     #[tool(
         title = "Import media",
-        description = "Import media files by absolute path (MP4/MOV, WAV/MP3/FLAC/AIFF/Ogg, PNG/JPEG/…).",
+        description = "Import media files or folders by absolute path (MP4/MOV, WAV/MP3/FLAC/AIFF/Ogg, PNG/JPEG/…), one per line. A folder imports its media into a bin of its name, sub-folders into bins inside it; other files are skipped and listed.",
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
     async fn media_import(&self, Parameters(p): Parameters<TypeParams>) -> Result<CallToolResult, McpError> {
