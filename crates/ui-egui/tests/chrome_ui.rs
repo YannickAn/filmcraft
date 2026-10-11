@@ -56,6 +56,32 @@ fn hidden_header_and_status_bar_give_the_panels_the_window() {
     assert!(h.state().ui_error.is_none(), "{:?}", h.state().ui_error);
 }
 
+/// A status message naming a menu path ("check Settings ▸ Audio Hardware") draws "▸" as a glyph,
+/// not the missing-glyph box (the UI face, Inter, has no "▸"; the theme's symbol fallback does).
+#[test]
+fn status_bar_draws_menu_path_arrows() {
+    const MESSAGE: &str = "Audio output failed: playing without sound (check Settings ▸ Audio Hardware)";
+    fn find(s: &egui::Shape) -> Option<std::sync::Arc<egui::Galley>> {
+        match s {
+            egui::Shape::Vec(v) => v.iter().find_map(find),
+            egui::Shape::Text(t) if t.galley.job.text == MESSAGE => Some(t.galley.clone()),
+            _ => None,
+        }
+    }
+    let mut h = harness(true, true);
+    h.state_mut().ui.status = MESSAGE.into();
+    h.step();
+    let galley = h.output().shapes.iter().find_map(|c| find(&c.shape)).expect("status message painted");
+    let font = galley.job.sections[0].format.font_id.clone();
+    let glyphs: Vec<_> = galley.rows.iter().flat_map(|r| r.glyphs.iter()).collect();
+    let arrow = glyphs.iter().find(|g| g.chr == '▸').expect("▸ laid out");
+    // the noncharacter U+10FFFF has no glyph in any face: it shows the missing-glyph box
+    let missing = h.ctx.fonts_mut(|f| f.layout_no_wrap("\u{10ffff}".into(), font.clone(), egui::Color32::WHITE));
+    assert!(!arrow.uv_rect.is_nothing(), "empty ▸ in {font:?}");
+    assert_ne!(arrow.uv_rect, missing.rows[0].glyphs[0].uv_rect, "▸ drawn as the missing-glyph box in {font:?}");
+    h.step();
+}
+
 #[test]
 fn saved_ui_state_without_the_flags_shows_the_chrome() {
     let mut v = serde_json::to_value(UiState::default()).unwrap();

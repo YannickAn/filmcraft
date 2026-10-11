@@ -851,9 +851,9 @@ mod tests {
                 .collect();
             for family in crate::theme::font_families() {
                 let font = egui::FontId::new(13.0, family);
-                // has_glyph compares font faces, giving false negatives when Inter also supplies
-                // the replacement character (the named medium/semibold stacks). Compare the
-                // actual glyph texture regions instead; the noncharacter U+10FFFF is missing.
+                // has_glyph compares font faces, giving false negatives for characters of the
+                // face that also supplies the replacement character. Compare the actual glyph
+                // texture regions instead; the noncharacter U+10FFFF is missing.
                 let text: String = chars.iter().copied().chain(['\u{10ffff}']).collect();
                 let galley = fonts.layout_no_wrap(text, font.clone(), egui::Color32::WHITE);
                 let glyphs = &galley.rows[0].glyphs;
@@ -894,10 +894,9 @@ mod tests {
                     assert_eq!(stack.last().map(String::as_str), Some(JAPANESE_FONT), "{family:?}: {stack:?}");
                 }
             }
-            // and the glyphs resolve. (Only families whose replacement-box face is another font:
-            // egui's `has_glyph` reports false for any character served by the face it also uses
-            // for the replacement box, which in the Inter-only "medium"/"semibold" stacks is the
-            // Japanese font itself.)
+            // and the glyphs resolve. (egui's `has_glyph` reports false for any character served
+            // by the face it also uses for the replacement box; here that is an earlier face,
+            // never the Japanese font.)
             for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
                 let font = egui::FontId::new(13.0, family);
                 for ch in JAPANESE_SAMPLE.chars() {

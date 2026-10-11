@@ -141,6 +141,24 @@ impl Driver {
         (bin.id.0, items)
     }
 
+    /// Every text the last frame painted, as laid out (with "…" when cut).
+    fn painted_texts(&self) -> Vec<Painted> {
+        fn walk(s: &egui::Shape, out: &mut Vec<Painted>) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                egui::Shape::Text(t) => {
+                    let text = t.galley.rows.iter().flat_map(|r| r.glyphs.iter().map(|g| g.chr)).collect();
+                    let rect = t.galley.rect.translate(t.pos.to_vec2());
+                    out.push(Painted { source: t.galley.job.text.clone(), text, rect, elided: t.galley.elided });
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        self.harness.output().shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        out
+    }
+
     fn snapshot(&mut self, name: &str, prefix: Option<&str>) {
         let Some(dir) = self.snapshots.clone() else { return };
         let crop = prefix.map(|p| self.rect(p));
@@ -166,6 +184,15 @@ impl Driver {
         img.save(&path).unwrap();
         eprintln!("snapshot: {}", path.display());
     }
+}
+
+/// A painted text: what was asked for, what was drawn, where, and whether it was cut.
+#[derive(Debug)]
+struct Painted {
+    source: String,
+    text: String,
+    rect: egui::Rect,
+    elided: bool,
 }
 
 /// The demo project with the Project panel maximized (room for the List view's columns).
@@ -284,6 +311,60 @@ fn icon_view_hover_scrub_sets_in_and_out() {
     // up one level
     d.click("project.up");
     assert_eq!(d.app().ui.project_panel.bin, None);
+}
+
+/// Long names in the Icon view are cut with "…" before a bin's item count and a clip's duration
+/// (they used to run into the count: "Dreh 2026-10" under "5 items"), and the full name shows in
+/// a tooltip over the name.
+#[test]
+fn icon_view_cuts_long_names_before_count_and_duration() {
+    const BIN_NAME: &str = "Dreh 2026-10-11 Interviews Kamera A";
+    const CLIP_NAME: &str = "A001_C001_0101_Interview_Kamera_A.mov";
+    let mut d = project_driver();
+    let (bin, items) = d.footage();
+    d.exec("project.renameBin", json!({"bin": bin, "name": BIN_NAME}));
+    d.exec("clip.rename", json!({"item": items[0], "name": CLIP_NAME}));
+    d.exec("project.view.set", json!({"view": "icon"}));
+    let card = format!("project.bin.{bin}");
+    d.wait_for(&card);
+    d.frames(2);
+    let [x, y, w, h] = d.rect(&card);
+    let texts = d.painted_texts();
+    let name = texts.iter().find(|t| t.source == BIN_NAME).expect("bin name painted");
+    let count = texts.iter().find(|t| t.source.ends_with(" items") && (t.rect.center().y - name.rect.center().y).abs() < 4.0).expect("item count");
+    assert!(name.elided && name.text.ends_with('…'), "{name:?}");
+    assert!(name.rect.max.x <= count.rect.min.x, "{name:?} runs into {count:?}");
+    assert!(name.rect.min.x >= x && count.rect.max.x <= x + w + 0.5, "{name:?} {count:?} outside the card at {x}+{w}");
+    // the full name in a tooltip over the name
+    d.ok("ui.move", json!({"x": x + 10.0, "y": y + h + 11.0}));
+    d.frames(6);
+    assert!(d.painted_texts().iter().any(|t| t.source == BIN_NAME && !t.elided), "no tooltip with the full bin name");
+
+    // a clip card: the name stops before the duration
+    double_click_bin(&mut d, bin, false);
+    let card = format!("project.item.{}", items[0]);
+    d.wait_for(&card);
+    d.frames(2);
+    let [x, y, w, h] = d.rect(&card);
+    let texts = d.painted_texts();
+    let name = texts.iter().find(|t| t.source == CLIP_NAME).expect("clip name painted");
+    let dur = texts
+        .iter()
+        .find(|t| t.source.contains(':') && t.source.chars().all(|c| c.is_ascii_digit() || c == ':') && (t.rect.center().y - name.rect.center().y).abs() < 4.0)
+        .expect("duration");
+    assert!(name.elided && name.text.ends_with('…'), "{name:?}");
+    assert!(name.rect.max.x <= dur.rect.min.x, "{name:?} runs into {dur:?}");
+    assert!(dur.rect.max.x <= x + w + 0.5, "{dur:?} outside the card at {x}+{w}");
+    d.ok("ui.move", json!({"x": x + 20.0, "y": y + h + 11.0}));
+    d.frames(6);
+    assert!(d.painted_texts().iter().any(|t| t.source == CLIP_NAME && !t.elided), "no tooltip with the full clip name");
+    // a short name is drawn whole, with no tooltip
+    d.exec("clip.rename", json!({"item": items[0], "name": "A001"}));
+    d.frames(6);
+    let texts = d.painted_texts();
+    let short: Vec<_> = texts.iter().filter(|t| t.source == "A001").collect();
+    assert_eq!(short.len(), 1, "{short:?}");
+    assert!(!short[0].elided && short[0].text == "A001");
 }
 
 #[test]
