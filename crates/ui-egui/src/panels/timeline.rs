@@ -54,6 +54,18 @@ pub struct TlState {
     /// display gain: scanning the whole source per clip per frame cost more than drawing.
     peak_max: HashMap<PeakKey, (usize, f32)>,
     zoom_anchor: Option<(f64, f32)>,
+    /// A track being made taller or shorter on its own (Alt + drag on its header).
+    track_resize: Option<TrackResize>,
+}
+
+/// Alt + drag on a track header: that track's height follows the pointer.
+#[derive(Clone, Copy, Debug)]
+struct TrackResize {
+    track: TrackId,
+    kind: TrackKind,
+    /// Where the button went down, and the track's height then.
+    from_y: f32,
+    from_h: f32,
 }
 
 /// What waveform peaks are cached by: the media item and the audio stream a clip plays (a
@@ -320,27 +332,30 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let split_y = tracks_area.min.y + (tracks_area.height() - DIVIDER_H) * app.ui.timeline.split;
     let video_area = Rect::from_min_max(pos2(rect.min.x, tracks_area.min.y), pos2(content.max.x, split_y));
     let audio_area = Rect::from_min_max(pos2(rect.min.x, split_y + DIVIDER_H), pos2(content.max.x, tracks_area.max.y - MASTER_H));
-    let vh = app.ui.timeline.video_track_h;
-    let ah = app.ui.timeline.audio_track_h;
+    // each track's height: its own (Alt + drag on its header), else its kind's
+    let tv = &app.ui.timeline;
+    let vhs: Vec<f32> = seq.video_tracks.iter().map(|tr| tv.track_height(tr.id, TrackKind::Video)).collect();
+    let ahs: Vec<f32> = seq.audio_tracks.iter().map(|tr| tv.track_height(tr.id, TrackKind::Audio)).collect();
     let mut rows = Vec::new();
     // Video: V1 at the bottom of the video area, stacking upward; v_scroll shifts up.
-    let nv = seq.video_tracks.len();
-    let video_total = nv as f32 * vh;
+    let video_total: f32 = vhs.iter().sum();
     let v_off = (video_area.height() - video_total).max(0.0);
     let max_vs = (video_total - video_area.height()).max(0.0);
     app.ui.timeline.v_scroll = app.ui.timeline.v_scroll.clamp(0.0, max_vs);
-    for (i, tr) in seq.video_tracks.iter().enumerate() {
-        let top = video_area.min.y + v_off + (nv - 1 - i) as f32 * vh - (max_vs - app.ui.timeline.v_scroll);
-        let rect = Rect::from_min_max(pos2(content.min.x, top), pos2(content.max.x, top + vh));
+    let mut bottom = video_area.min.y + v_off + video_total - (max_vs - app.ui.timeline.v_scroll);
+    for ((i, tr), h) in seq.video_tracks.iter().enumerate().zip(&vhs) {
+        let rect = Rect::from_min_max(pos2(content.min.x, bottom - h), pos2(content.max.x, bottom));
         rows.push(Row { track: tr.id, kind: TrackKind::Video, index: i, rect, lane: false });
+        bottom -= h;
     }
-    let na = seq.audio_tracks.len();
-    let max_as = (na as f32 * ah - audio_area.height()).max(0.0);
+    let audio_total: f32 = ahs.iter().sum();
+    let max_as = (audio_total - audio_area.height()).max(0.0);
     app.ui.timeline.a_scroll = app.ui.timeline.a_scroll.clamp(0.0, max_as);
-    for (i, tr) in seq.audio_tracks.iter().enumerate() {
-        let top = audio_area.min.y + i as f32 * ah - app.ui.timeline.a_scroll;
-        let rect = Rect::from_min_max(pos2(content.min.x, top), pos2(content.max.x, top + ah));
+    let mut top = audio_area.min.y - app.ui.timeline.a_scroll;
+    for ((i, tr), h) in seq.audio_tracks.iter().enumerate().zip(&ahs) {
+        let rect = Rect::from_min_max(pos2(content.min.x, top), pos2(content.max.x, top + h));
         rows.push(Row { track: tr.id, kind: TrackKind::Audio, index: i, rect, lane: app.ui.timeline.track_lanes.contains_key(&tr.id.0) });
+        top += h;
     }
     let layout = Layout { content, ruler, rows: rows.clone(), pps, scroll, split_y };
     app.tl.layout = Some(layout.clone());
@@ -997,6 +1012,9 @@ fn draw_headers(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, rows:
         p.rect_filled(hrect, 0.0, t.tl_header_bg);
         p.line_segment([pos2(hrect.min.x, hrect.max.y - 0.5), pos2(hrect.max.x, hrect.max.y - 0.5)], Stroke::new(1.0, t.separator));
         let label = format!("{}{}", if r.kind == TrackKind::Video { "V" } else { "A" }, r.index + 1);
+        // 0. Alt + drag anywhere on the header: this track's height alone, as in Premiere. It lies
+        // under the buttons, which keep their clicks.
+        track_resize_area(app, ui, r, visible, &label);
         let btn_rect = |x0: f32| Rect::from_min_max(pos2(hrect.min.x + x0, hrect.min.y + 1.0), pos2(hrect.min.x + x0 + 24.0, hrect.max.y - 2.0));
         // 1. source patch (absent when unpatched)
         let patched = if r.kind == TrackKind::Video { tg.video_dest == Some(r.track) } else { tg.audio_dest == Some(r.track) };
@@ -1105,29 +1123,80 @@ fn draw_headers(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, rows:
             if eresp.hovered() || eresp.dragged() {
                 ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
             }
+            // every track of the kind (those with a height of their own too); with Alt this one only
+            if eresp.drag_started() {
+                app.tl.track_resize = None;
+            }
             if eresp.dragged() {
                 let d = eresp.drag_delta().y * if r.kind == TrackKind::Video { -1.0 } else { 1.0 };
-                let h = if r.kind == TrackKind::Video { &mut app.ui.timeline.video_track_h } else { &mut app.ui.timeline.audio_track_h };
-                *h = (*h + d).clamp(22.0, 220.0);
+                if ui.input(|i| i.modifiers.alt) {
+                    let h = app.ui.timeline.track_height(r.track, r.kind) + d;
+                    super::keyboard::set_track_height(app, r.track, r.kind, Some(h));
+                } else {
+                    super::keyboard::resize_kind(app, r.kind, d, 22.0, 220.0);
+                }
             }
         }
         let hdr = Rect::from_min_max(pos2(hrect.min.x + 90.0, hrect.min.y + 26.0), hrect.max).intersect(visible);
         let resp = ui.interact(hdr, egui::Id::new(("hdr", r.track.0)), Sense::click());
         app.auto.add(&format!("timeline.track.{label}.header"), hdr, "Track header (double-click to expand or collapse)");
+        // a double-click expands or collapses this track (Premiere)
         if resp.double_clicked() {
-            let h = if r.kind == TrackKind::Video { &mut app.ui.timeline.video_track_h } else { &mut app.ui.timeline.audio_track_h };
-            *h = if *h < 50.0 { 64.0 } else { 30.0 };
+            let h = if app.ui.timeline.track_height(r.track, r.kind) < 50.0 { 64.0 } else { 30.0 };
+            actions.push(("timeline.setTrackHeight".into(), json!({"track": r.track.0, "height": h})));
         }
     }
     // column separator
     ui.painter().line_segment([pos2(rect.min.x + hw - 0.5, vclip.min.y), pos2(rect.min.x + hw - 0.5, aclip.max.y + MASTER_H)], Stroke::new(1.0, t.separator));
+    let ctx = ui.ctx().clone();
     for (cmd, params) in actions {
-        if let Err(e) = app.session.execute(&cmd, params) {
-            app.ui.status = e.to_string();
+        // UI commands (a track's height) run through the menus, engine commands in the session
+        let r = if cmd == "timeline.setTrackHeight" {
+            crate::menus::invoke(app, &ctx, &cmd, params)
+        } else {
+            app.session.execute(&cmd, params).map_err(|e| e.to_string())
+        };
+        if let Err(e) = r {
+            app.ui.status = e;
         }
     }
     if let Some(a) = vo_action {
         super::voiceover::run(app, &ui.ctx().clone(), a);
+    }
+}
+
+/// Alt + drag on a track header (`visible`: the part of it on screen) makes that track taller or
+/// shorter, and nothing else: its edge away from the video / audio divider follows the pointer. A
+/// drag without Alt does nothing here. On release the height is set by `timeline.setTrackHeight`,
+/// so the gesture is journaled and reported like any other.
+fn track_resize_area(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: &Row, visible: Rect, label: &str) {
+    let resp = ui.interact(visible, egui::Id::new(("trackResize", r.track.0)), Sense::drag());
+    app.auto.add(&format!("timeline.track.{label}.height"), visible, "Track height (Alt + drag)");
+    let alt = ui.input(|i| i.modifiers.alt);
+    let mine = app.tl.track_resize.is_some_and(|d| d.track == r.track);
+    if (resp.hovered() && alt) || mine {
+        ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
+    }
+    if resp.drag_started() {
+        let from_y = ui.input(|i| i.pointer.press_origin()).map_or(visible.center().y, |p| p.y);
+        app.tl.track_resize = alt.then(|| TrackResize { track: r.track, kind: r.kind, from_y, from_h: app.ui.timeline.track_height(r.track, r.kind) });
+    }
+    let Some(d) = app.tl.track_resize.filter(|d| d.track == r.track) else { return };
+    // video tracks stack up from V1, audio tracks down from A1: dragging away from the divider
+    // makes a track taller
+    let dir = if d.kind == TrackKind::Video { -1.0 } else { 1.0 };
+    if let Some(y) = resp.interact_pointer_pos().map(|p| p.y)
+        && (resp.dragged() || resp.drag_stopped())
+    {
+        super::keyboard::set_track_height(app, d.track, d.kind, Some((d.from_h + (y - d.from_y) * dir).round()));
+    }
+    if resp.drag_stopped() || !resp.dragged() {
+        app.tl.track_resize = None;
+        let h = app.ui.timeline.track_height(d.track, d.kind);
+        let ctx = ui.ctx().clone();
+        if let Err(e) = crate::menus::invoke(app, &ctx, "timeline.setTrackHeight", json!({"track": d.track.0, "height": h})) {
+            app.ui.status = e;
+        }
     }
 }
 
@@ -1197,10 +1266,12 @@ fn draw_top(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, seq: &Sequenc
                 if ui.button(tl!("Expand All Tracks")).clicked() {
                     app.ui.timeline.video_track_h = 64.0;
                     app.ui.timeline.audio_track_h = 64.0;
+                    app.ui.timeline.track_heights.clear();
                 }
                 if ui.button(tl!("Minimize All Tracks")).clicked() {
                     app.ui.timeline.video_track_h = 26.0;
                     app.ui.timeline.audio_track_h = 26.0;
+                    app.ui.timeline.track_heights.clear();
                 }
             });
         }

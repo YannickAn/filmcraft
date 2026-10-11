@@ -15,6 +15,7 @@
 //! | `playback.inToOutPreroll` / `playback.toOut` | Play In to Out with Preroll/Postroll / Play from Playhead to Out Point | Shift+Space / Ctrl+Space |
 //! | `timeline.expandAllTracks` / `timeline.minimizeAllTracks` | Expand / Minimize All Tracks | Shift+= / Shift+- |
 //! | `timeline.increaseVideoHeight` … `timeline.decreaseAudioHeight` | Increase / Decrease Video / Audio Tracks Height | Cmd+= / Cmd+- / Alt+= / Alt+- (Timeline) |
+//! | `timeline.setTrackHeight` | One track's height (Alt + drag on its header, double-click to expand or collapse it) | |
 //! | `timeline.nextScreen` / `timeline.prevScreen` | Show Next / Previous Screen | PageDown / PageUp (Timeline) |
 //! | `timeline.playheadToCursor` | Move Playhead to Cursor (the frame under the pointer) | |
 //! | `mixer.showHideTracks` / `mixer.meterInputOnly` | Audio Track Mixer ▸ Show/Hide Tracks…, Meter Input(s) Only | |
@@ -31,7 +32,9 @@ use serde_json::{Value, json};
 use crate::FilmcraftApp;
 use crate::dock::PanelKind;
 use crate::menus::UiCommand;
+use crate::state::{MAX_TRACK_H as MAX_OWN_H, MIN_TRACK_H as MIN_OWN_H};
 use filmcraft_engine::project_panel::ViewMode;
+use filmcraft_project::{TrackId, TrackKind};
 
 /// Keyboard-only view state.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -41,13 +44,15 @@ pub struct KeysState {
     pub maximized: Option<PanelKind>,
     /// Track heights before Expand / Minimize All Tracks (pressing again restores them).
     pub saved_heights: Option<[f32; 2]>,
+    /// The heights single tracks had of their own then.
+    pub saved_track_heights: std::collections::BTreeMap<TrackId, f32>,
     /// Icon view columns in the last frame (Move Selection Up / Down step).
     pub icon_columns: usize,
 }
 
 impl Default for KeysState {
     fn default() -> Self {
-        Self { maximized: None, saved_heights: None, icon_columns: 1 }
+        Self { maximized: None, saved_heights: None, saved_track_heights: Default::default(), icon_columns: 1 }
     }
 }
 
@@ -82,6 +87,7 @@ pub const COMMANDS: &[UiCommand] = &[
     uic!("timeline.decreaseVideoHeight", "Decrease Video Tracks Height", [], None),
     uic!("timeline.increaseAudioHeight", "Increase Audio Tracks Height", [], None),
     uic!("timeline.decreaseAudioHeight", "Decrease Audio Tracks Height", [], None),
+    uic!("timeline.setTrackHeight", "Set Track Height", [], None),
     uic!("timeline.nextScreen", "Show Next Screen", [], None),
     uic!("timeline.prevScreen", "Show Previous Screen", [], None),
     uic!("timeline.playheadToCursor", "Move Playhead to Cursor", [], None),
@@ -203,11 +209,12 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
         "timeline.expandAllTracks" | "timeline.minimizeAllTracks" => Ok(all_heights(app, id == "timeline.expandAllTracks")),
         "timeline.increaseVideoHeight" | "timeline.decreaseVideoHeight" | "timeline.increaseAudioHeight" | "timeline.decreaseAudioHeight" => {
             let d = if id.contains("increase") { HEIGHT_STEP } else { -HEIGHT_STEP };
-            let tv = &mut app.ui.timeline;
-            let h = if id.contains("Video") { &mut tv.video_track_h } else { &mut tv.audio_track_h };
-            *h = (*h + d).clamp(MIN_TRACK_H, MAX_TRACK_H);
+            let kind = if id.contains("Video") { TrackKind::Video } else { TrackKind::Audio };
+            resize_kind(app, kind, d, MIN_TRACK_H, MAX_TRACK_H);
+            let tv = &app.ui.timeline;
             Ok(json!({"videoTrackHeight": tv.video_track_h, "audioTrackHeight": tv.audio_track_h}))
         }
+        "timeline.setTrackHeight" => set_track_height_command(app, params),
         "timeline.nextScreen" | "timeline.prevScreen" => {
             let tv = &mut app.ui.timeline;
             let w = (app.last_timeline_width.max(200.0) - tv.header_w) as f64;
@@ -368,21 +375,109 @@ fn play_range(app: &mut FilmcraftApp, preroll: bool) -> Result<Value, String> {
 fn all_heights(app: &mut FilmcraftApp, expand: bool) -> Value {
     let tv = &mut app.ui.timeline;
     let target = if expand { 120.0 } else { MIN_TRACK_H };
-    let at_target = tv.video_track_h == target && tv.audio_track_h == target;
+    let at_target = tv.video_track_h == target && tv.audio_track_h == target && tv.track_heights.is_empty();
     match (at_target, app.ui.keys.saved_heights) {
-        // pressing again restores the heights from before
+        // pressing again restores the heights from before, those of single tracks too
         (true, Some([v, a])) => {
             tv.video_track_h = v;
             tv.audio_track_h = a;
+            tv.track_heights = std::mem::take(&mut app.ui.keys.saved_track_heights);
             app.ui.keys.saved_heights = None;
         }
+        // every track the same height
         _ => {
             app.ui.keys.saved_heights = Some([tv.video_track_h, tv.audio_track_h]);
+            app.ui.keys.saved_track_heights = std::mem::take(&mut tv.track_heights);
             tv.video_track_h = target;
             tv.audio_track_h = target;
         }
     }
     json!({"videoTrackHeight": tv.video_track_h, "audioTrackHeight": tv.audio_track_h})
+}
+
+/// Every track of `kind` `d` points taller (shorter when negative): the height of the kind, kept
+/// within `min..=max`, and the heights tracks of that kind have of their own.
+pub fn resize_kind(app: &mut FilmcraftApp, kind: TrackKind, d: f32, min: f32, max: f32) {
+    if !d.is_finite() {
+        return;
+    }
+    let tracks: Vec<TrackId> = app
+        .session
+        .active_sequence()
+        .map(|q| if kind == TrackKind::Video { &q.video_tracks } else { &q.audio_tracks }.iter().map(|t| t.id).collect())
+        .unwrap_or_default();
+    let tv = &mut app.ui.timeline;
+    let h = if kind == TrackKind::Video { &mut tv.video_track_h } else { &mut tv.audio_track_h };
+    *h = (*h + d).clamp(min, max);
+    for t in tracks {
+        if let Some(h) = tv.track_heights.get_mut(&t) {
+            *h = (*h + d).clamp(MIN_OWN_H, MAX_OWN_H);
+        }
+    }
+}
+
+/// A video or audio track of the open sequence, by id (`5`, `"5"`) or by the name its header
+/// shows (`"V2"`, `"A1"`).
+pub fn find_track(app: &FilmcraftApp, v: &Value) -> Result<(TrackId, TrackKind), String> {
+    let seq = app.session.active_sequence().ok_or("no sequence is open")?;
+    let by_id = |id: u64| seq.track(TrackId(id)).map(|t| (t.id, t.kind));
+    let found = match v {
+        Value::Number(n) => n.as_u64().and_then(by_id),
+        Value::String(s) => {
+            let s = s.trim();
+            match s.parse::<u64>() {
+                Ok(id) => by_id(id),
+                Err(_) => {
+                    let (kind, n) = s.split_at_checked(1).unwrap_or_default();
+                    let index = n.parse::<usize>().ok().and_then(|n| n.checked_sub(1));
+                    let list = match kind {
+                        "V" | "v" => Some(&seq.video_tracks),
+                        "A" | "a" => Some(&seq.audio_tracks),
+                        _ => None,
+                    };
+                    list.zip(index).and_then(|(l, i)| l.get(i)).map(|t| (t.id, t.kind))
+                }
+            }
+        }
+        _ => None,
+    };
+    found.filter(|(_, k)| matches!(k, TrackKind::Video | TrackKind::Audio)).ok_or_else(|| format!("no track {v} in the open sequence (a track id, or V1, A2…)"))
+}
+
+/// Give one track a height of its own, in points (kept within the range of a single track), or
+/// with `None` the height of its kind again. Returns the height of the track now.
+pub fn set_track_height(app: &mut FilmcraftApp, track: TrackId, kind: TrackKind, height: Option<f32>) -> f32 {
+    let tv = &mut app.ui.timeline;
+    match height.filter(|h| h.is_finite()) {
+        Some(h) => {
+            tv.track_heights.insert(track, h.clamp(MIN_OWN_H, MAX_OWN_H));
+        }
+        None => {
+            tv.track_heights.remove(&track);
+        }
+    }
+    tv.track_height(track, kind)
+}
+
+/// `timeline.setTrackHeight {track, height | delta | reset}`: the height of one track (what Alt +
+/// drag on a track header and a double-click on it run). `track`: an id, or V1, A2…; `height` in
+/// points, or `delta` points more; `reset: true` gives it the height of its kind again.
+fn set_track_height_command(app: &mut FilmcraftApp, params: &Value) -> Result<Value, String> {
+    let (track, kind) = find_track(app, params.get("track").ok_or("missing `track` (a track id, or V1, A2…)")?)?;
+    let height = if params.get("reset").and_then(Value::as_bool) == Some(true) {
+        None
+    } else if let Some(h) = params.get("height").and_then(Value::as_f64) {
+        Some(h as f32)
+    } else if let Some(d) = params.get("delta").and_then(Value::as_f64) {
+        Some(app.ui.timeline.track_height(track, kind) + d as f32)
+    } else {
+        return Err("give `height` (points), `delta` (points) or `reset: true`".into());
+    };
+    if height.is_some_and(|h| !h.is_finite()) {
+        return Err("the height must be a finite number".into());
+    }
+    let h = set_track_height(app, track, kind, height);
+    Ok(json!({"track": track.0, "height": h, "own": app.ui.timeline.track_heights.contains_key(&track)}))
 }
 
 fn begin_text_editing(app: &mut FilmcraftApp) -> Result<Value, String> {

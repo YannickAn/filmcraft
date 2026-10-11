@@ -67,11 +67,22 @@ fn err(e: impl std::fmt::Display) -> Outcome {
 }
 
 /// Modifier flags from `{modifiers: {ctrl, command, shift, alt}}` (or the same keys at the top
-/// level), as the OS would report them pressed.
+/// level), or written as keys: `{modifiers: "Alt"}`, `"Cmd+Shift"`, `["alt", "shift"]`; as the
+/// OS would report them pressed.
 fn modifiers(p: &Value) -> egui::Modifiers {
     let m = p.get("modifiers").unwrap_or(p);
+    let names: Vec<String> = match m {
+        Value::String(s) => s.split('+').map(|k| k.trim().to_ascii_lowercase()).collect(),
+        Value::Array(a) => a.iter().filter_map(Value::as_str).map(|k| k.trim().to_ascii_lowercase()).collect(),
+        _ => Vec::new(),
+    };
+    let named = |keys: &[&str]| names.iter().any(|n| keys.contains(&n.as_str()));
     let b = |k: &str| m.get(k).and_then(Value::as_bool).unwrap_or(false);
-    as_pressed(egui::Modifiers { alt: b("alt"), ctrl: b("ctrl"), shift: b("shift"), mac_cmd: cfg!(target_os = "macos") && b("command"), command: b("command") })
+    let alt = b("alt") || named(&["alt", "option", "opt"]);
+    let ctrl = b("ctrl") || named(&["ctrl", "control"]);
+    let shift = b("shift") || named(&["shift"]);
+    let command = b("command") || named(&["cmd", "command", "meta", "super"]);
+    as_pressed(egui::Modifiers { alt, ctrl, shift, mac_cmd: cfg!(target_os = "macos") && command, command })
 }
 
 /// `m` as egui-winit reports a physical press: off macOS Control is the primary modifier, so
@@ -232,6 +243,23 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
                 }
                 if let Some(v) = tl.get("audioTrackHeight").and_then(Value::as_f64) {
                     app.ui.timeline.audio_track_h = v as f32;
+                }
+                // single tracks' heights: {"V2": 120, "A1": null (its kind's height again), "7": 90}
+                if let Some(m) = tl.get("trackHeights").and_then(Value::as_object) {
+                    for (track, h) in m {
+                        let (id, kind) = match crate::panels::keyboard::find_track(app, &Value::String(track.clone())) {
+                            Ok(t) => t,
+                            Err(e) => return err(e),
+                        };
+                        let h = match h {
+                            Value::Null => None,
+                            h => match h.as_f64().filter(|h| h.is_finite()) {
+                                Some(h) => Some(h as f32),
+                                None => return err(format!("`trackHeights.{track}`: a height in points, or null")),
+                            },
+                        };
+                        crate::panels::keyboard::set_track_height(app, id, kind, h);
+                    }
                 }
             }
             if let Some(q) = s("effectsSearch") {
